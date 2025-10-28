@@ -4,6 +4,8 @@ import re
 from difflib import SequenceMatcher
 from io import BytesIO
 from streamlit_sortables import sort_items
+import msoffcrypto
+import io
 
 st.set_page_config(page_title="Excel Smart Diff Manager", layout="wide")
 st.title("📊 Excel Smart Diff Manager (Auto Match + Manual Order)")
@@ -11,6 +13,32 @@ st.markdown("""
 Upload multiple Excel files on both sides — automatically matches and compares content,  
 even when rows are shuffled or TRUE/FALSE become 1/0/Y/N.  
 """)
+
+def decrypt_if_needed_and_return_bytes(uploaded_file, password=None):
+    """
+    Returns a BytesIO object of the Excel file.
+    Raises ValueError("PASSWORD_REQUIRED") if password is needed but not provided.
+    Raises ValueError("BAD_PASSWORD") if the password is wrong.
+    """
+    raw = uploaded_file.read()
+    try:
+        _ = pd.ExcelFile(io.BytesIO(raw))
+        return io.BytesIO(raw)  # unencrypted
+    except Exception:
+        bio = io.BytesIO(raw)
+        office = msoffcrypto.OfficeFile(bio)
+        if not office.is_encrypted():
+            return io.BytesIO(raw)  # some other read error
+        if not password:
+            raise ValueError("PASSWORD_REQUIRED")
+        decrypted = io.BytesIO()
+        office.load_key(password=password)
+        try:
+            office.decrypt(decrypted)
+        except Exception:
+            raise ValueError("BAD_PASSWORD")
+        decrypted.seek(0)
+        return decrypted
 
 # ---------- Helper: Normalize filenames ----------
 def normalize_filename(name: str):
@@ -163,3 +191,4 @@ if left_files and right_files:
         )
 else:
     st.info("👆 Upload both OLD and NEW Excel files to start.")
+
