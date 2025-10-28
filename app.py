@@ -1,3 +1,4 @@
+# excel_diff_manager.py
 import streamlit as st
 import pandas as pd
 import re
@@ -7,38 +8,15 @@ from streamlit_sortables import sort_items
 import msoffcrypto
 import io
 
-st.set_page_config(page_title="Excel Smart Diff Manager", layout="wide")
+st.set_page_config(page_title="📊 Excel Smart Diff Manager", layout="wide")
+st.markdown("<style>section.main > div {padding-top: 1rem;}</style>", unsafe_allow_html=True)
+
 st.title("📊 Excel Smart Diff Manager (Auto Match + Manual Order)")
 st.markdown("""
 Upload multiple Excel files on both sides — automatically matches and compares content,  
 even when rows are shuffled or TRUE/FALSE become 1/0/Y/N.  
+Supports password-protected Excel files (enter password below when required).
 """)
-
-def decrypt_if_needed_and_return_bytes(uploaded_file, password=None):
-    """
-    Returns a BytesIO object of the Excel file.
-    Raises ValueError("PASSWORD_REQUIRED") if password is needed but not provided.
-    Raises ValueError("BAD_PASSWORD") if the password is wrong.
-    """
-    raw = uploaded_file.read()
-    try:
-        _ = pd.ExcelFile(io.BytesIO(raw))
-        return io.BytesIO(raw)  # unencrypted
-    except Exception:
-        bio = io.BytesIO(raw)
-        office = msoffcrypto.OfficeFile(bio)
-        if not office.is_encrypted():
-            return io.BytesIO(raw)  # some other read error
-        if not password:
-            raise ValueError("PASSWORD_REQUIRED")
-        decrypted = io.BytesIO()
-        office.load_key(password=password)
-        try:
-            office.decrypt(decrypted)
-        except Exception:
-            raise ValueError("BAD_PASSWORD")
-        decrypted.seek(0)
-        return decrypted
 
 # ---------- Helper: Normalize filenames ----------
 def normalize_filename(name: str):
@@ -109,6 +87,28 @@ def compare_sheets(df1, df2):
     removed_rows = df1.loc[~df1["_key"].isin(df2["_key"])].drop(columns=["_key"])
     return added_rows, removed_rows
 
+# ---------- Helper: Decrypt if password-protected ----------
+def decrypt_if_needed_and_return_bytes(uploaded_file, password=None):
+    raw = uploaded_file.read()
+    try:
+        _ = pd.ExcelFile(io.BytesIO(raw))
+        return io.BytesIO(raw)  # unencrypted
+    except Exception:
+        bio = io.BytesIO(raw)
+        office = msoffcrypto.OfficeFile(bio)
+        if not office.is_encrypted():
+            return io.BytesIO(raw)
+        if not password:
+            raise ValueError("PASSWORD_REQUIRED")
+        decrypted = io.BytesIO()
+        office.load_key(password=password)
+        try:
+            office.decrypt(decrypted)
+        except Exception:
+            raise ValueError("BAD_PASSWORD")
+        decrypted.seek(0)
+        return decrypted
+
 # ---------- Manual pairing UI ----------
 def manual_pairing(left_files, right_files):
     st.subheader("🎛️ Manual Pairing (Drag to align OLD ↔ NEW)")
@@ -125,11 +125,33 @@ def manual_pairing(left_files, right_files):
     st.success(f"✅ {len(pairs)} manual pairs formed.")
     return pairs
 
-# ---------- Main ----------
-left_files = st.file_uploader("📂 Upload OLD Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
-right_files = st.file_uploader("📂 Upload NEW Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
+# ---------- UI: Upload files ----------
+col1, col2 = st.columns(2)
+with col1:
+    left_files = st.file_uploader("📂 Upload OLD Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
+with col2:
+    right_files = st.file_uploader("📂 Upload NEW Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
 
+# session storage for passwords (ephemeral)
+if "file_passwords" not in st.session_state:
+    st.session_state["file_passwords"] = {}  # key: filename -> password
+
+# Show password inputs for files
+def show_password_inputs(files):
+    if not files:
+        return
+    for f in files:
+        key = f"pwd_{f.name}"
+        existing = st.session_state["file_passwords"].get(f.name, "")
+        pwd = st.text_input(f"Password for {f.name} (leave empty if none)", value=existing, type="password", key=key)
+        st.session_state["file_passwords"][f.name] = pwd
+
+show_password_inputs(left_files)
+show_password_inputs(right_files)
+
+# ---------- Main flow ----------
 if left_files and right_files:
+
     matched, unmatched_left, unmatched_right = auto_match(left_files, right_files)
 
     if matched:
@@ -141,54 +163,102 @@ if left_files and right_files:
 
     pairs = manual_pairing(left_files, right_files)
 
-    if st.button("🚀 Run Smart Comparison"):
+    if st.button("🚀 Run Smart Comparison (supports password-protected files)"):
         progress = st.progress(0)
-        total = len(pairs)
+        total = len(pairs) if pairs else 1
         output_buffer = BytesIO()
+        any_diff_overall = False
 
         with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+            # placeholder sheet to avoid "At least one sheet must be visible"
+            writer.book.create_sheet("Summary")
+
             for i, (lf, rf) in enumerate(pairs, 1):
                 progress.progress(i / total)
                 st.write(f"### {i}. Comparing {lf.name} ↔ {rf.name}")
+                pwd_l = st.session_state["file_passwords"].get(lf.name) or None
+                pwd_r = st.session_state["file_passwords"].get(rf.name) or None
+
                 try:
-                    xls1 = pd.ExcelFile(lf)
-                    xls2 = pd.ExcelFile(rf)
-                    common_sheets = set(xls1.sheet_names).intersection(xls2.sheet_names)
-                    any_diff = False
-
-                    for sheet in common_sheets:
-                        st.subheader(f"📄 Sheet: `{sheet}`")
-                        df1 = pd.read_excel(lf, sheet_name=sheet)
-                        df2 = pd.read_excel(rf, sheet_name=sheet)
-                        added, removed = compare_sheets(df1, df2)
-
-                        if added.empty and removed.empty:
-                            st.success("✅ No differences found.")
-                        else:
-                            any_diff = True
-                            if not added.empty:
-                                st.info(f"🟢 Added {len(added)} row(s):")
-                                st.dataframe(added)
-                                added.to_excel(writer, sheet_name=f"{lf.name}_ADDED", index=False)
-                            if not removed.empty:
-                                st.warning(f"🔴 Removed {len(removed)} row(s):")
-                                st.dataframe(removed)
-                                removed.to_excel(writer, sheet_name=f"{lf.name}_REMOVED", index=False)
-
-                    if not any_diff:
-                        st.success(f"🎉 {lf.name} identical to {rf.name}")
-
+                    bf_l = decrypt_if_needed_and_return_bytes(lf, password=pwd_l)
+                    bf_r = decrypt_if_needed_and_return_bytes(rf, password=pwd_r)
+                except ValueError as ve:
+                    if str(ve) == "PASSWORD_REQUIRED":
+                        st.error(f"🔒 {lf.name if 'lf' in locals() else rf.name} is password-protected — please enter its password and run again.")
+                        continue
+                    if str(ve) == "BAD_PASSWORD":
+                        st.error(f"❌ Wrong password for {lf.name if 'lf' in locals() else rf.name}. Please correct it and run again.")
+                        continue
+                    continue
                 except Exception as e:
-                    st.error(f"❌ Error comparing {lf.name} ↔ {rf.name}: {e}")
+                    st.error(f"❌ Unexpected error opening {lf.name if 'lf' in locals() else rf.name}: {e}")
+                    continue
+
+                try:
+                    xls1 = pd.ExcelFile(bf_l)
+                    xls2 = pd.ExcelFile(bf_r)
+                except Exception as e:
+                    st.error(f"❌ Failed to parse Excel structure for the pair: {e}")
+                    continue
+
+                common_sheets = set(xls1.sheet_names).intersection(xls2.sheet_names)
+                any_diff_for_pair = False
+
+                for sheet in common_sheets:
+                    st.markdown(f"📄 **Sheet:** `{sheet}`")
+                    try:
+                        df1 = pd.read_excel(bf_l, sheet_name=sheet)
+                        df2 = pd.read_excel(bf_r, sheet_name=sheet)
+                    except Exception as e:
+                        st.error(f"❌ Error reading sheet `{sheet}`: {e}")
+                        continue
+
+                    added, removed = compare_sheets(df1, df2)
+
+                    if added.empty and removed.empty:
+                        st.success("✅ No differences in this sheet.")
+                    else:
+                        any_diff_for_pair = True
+                        any_diff_overall = True
+                        if not added.empty:
+                            st.info(f"🟢 {len(added)} added row(s) in NEW file:")
+                            st.dataframe(added)
+                            safe_name = f"P{i}_{rf.name}_ADDED_{sheet}"[:31]
+                            try:
+                                added.to_excel(writer, sheet_name=safe_name, index=False)
+                            except Exception:
+                                added.to_excel(writer, sheet_name=f"P{i}_ADDED_{sheet}"[:31], index=False)
+                        if not removed.empty:
+                            st.warning(f"🔴 {len(removed)} removed row(s) from OLD file:")
+                            st.dataframe(removed)
+                            safe_name = f"P{i}_{lf.name}_REMOVED_{sheet}"[:31]
+                            try:
+                                removed.to_excel(writer, sheet_name=safe_name, index=False)
+                            except Exception:
+                                removed.to_excel(writer, sheet_name=f"P{i}_REMOVED_{sheet}"[:31], index=False)
+
+                if not any_diff_for_pair:
+                    st.success(f"🎉 {lf.name} identical to {rf.name}")
+
+            # finalize writer
+            if any_diff_overall:
+                if "Summary" in writer.book.sheetnames and len(writer.book.sheetnames) > 1:
+                    del writer.book["Summary"]
+            else:
+                pd.DataFrame([["No differences found across compared files."]]).to_excel(
+                    writer, sheet_name="Summary", index=False, header=False
+                )
 
         progress.empty()
 
-        st.download_button(
-            label="📥 Download Differences as Excel",
-            data=output_buffer.getvalue(),
-            file_name="all_differences.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        if any_diff_overall:
+            st.download_button(
+                label="📥 Download Differences as Excel",
+                data=output_buffer.getvalue(),
+                file_name="all_differences.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.success("✅ No differences found across all files.")
 else:
     st.info("👆 Upload both OLD and NEW Excel files to start.")
-
