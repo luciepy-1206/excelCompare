@@ -16,10 +16,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Helper Functions (Revised for keyless operation) ---
+# --- Helper Functions (No changes needed in this section) ---
 #<editor-fold desc="Helper Functions">
 def auto_match(left_files, right_files, threshold):
-    """Fast and standard difflib for filename matching."""
     potential_matches = []
     for lf in left_files:
         lf_norm = lf.name.lower()
@@ -40,13 +39,8 @@ def auto_match(left_files, right_files, threshold):
 
 def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files):
     st.subheader(f"🎛️ Manually Align Files")
-    # Using original file objects for stable sorting in sort_items
-    initial_left = [lf for lf, _, _ in matched] + unmatched_left
-    initial_right = [rf for _, rf, _ in matched] + unmatched_right
-    
-    # Create name lists for display
-    initial_left_names = [f.name for f in initial_left]
-    initial_right_names = [f.name for f in initial_right]
+    initial_left_names = [lf.name for lf, _, _ in matched] + [f.name for f in unmatched_left]
+    initial_right_names = [rf.name for _, rf, _ in matched] + [f.name for f in unmatched_right]
 
     len_diff = len(initial_left_names) - len(initial_right_names)
     if len_diff > 0: initial_right_names.extend(["---"] * len_diff)
@@ -56,7 +50,7 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
     with c1:
         st.markdown(f"#### 📂 OLD Files"); sorted_left_names = sort_items(initial_left_names, key="old_files")
     with c2:
-        st.markdown(f"#### 🗂️ NEW Files"); sorted_right_names = sort_items(initial_right_names, key="new_files")
+        st.markdown(f"#### 𗂂 NEW Files"); sorted_right_names = sort_items(initial_right_names, key="new_files")
         
     left_dict = {f.name: f for f in left_files}
     right_dict = {f.name: f for f in right_files}
@@ -80,39 +74,28 @@ def decrypt_file_bytes(uploaded_file, password=None):
         except Exception as e: raise RuntimeError(f"File decryption failed: {e}")
 
 def normalize_df_fast(df):
-    """Simplified, high-performance DataFrame normalization."""
     df = df.fillna('').astype(str)
     for col in df.columns:
         df[col] = df[col].str.strip()
     return df
 
 def compare_sheets_keyless(df1, df2):
-    """High-performance comparison using row hashing. Does not find 'changed' rows, only added/removed."""
     cols1, cols2 = set(df1.columns), set(df2.columns)
     added_cols, removed_cols = sorted(list(cols2 - cols1)), sorted(list(cols1 - cols2))
     
-    if df1.empty and not df2.empty:
-        return df2, pd.DataFrame(), added_cols, removed_cols
-    if df2.empty and not df1.empty:
-        return pd.DataFrame(), df1, added_cols, removed_cols
-    if df1.empty and df2.empty:
-        return pd.DataFrame(), pd.DataFrame(), added_cols, removed_cols
+    if df1.empty: return df2, pd.DataFrame(columns=df1.columns), added_cols, removed_cols
+    if df2.empty: return pd.DataFrame(columns=df2.columns), df1, added_cols, removed_cols
 
     df1_norm = normalize_df_fast(df1.copy())
     df2_norm = normalize_df_fast(df2.copy())
 
-    # Create a hash for each row based on its content
     df1_hashes = pd.util.hash_pandas_object(df1_norm, index=False)
     df2_hashes = pd.util.hash_pandas_object(df2_norm, index=False)
 
-    # Use the hashes to find which rows are unique to each dataframe
     added_mask = ~df2_hashes.isin(df1_hashes)
     removed_mask = ~df1_hashes.isin(df2_hashes)
 
-    added_rows = df2[added_mask]
-    removed_rows = df1[removed_mask]
-    
-    return added_rows, removed_rows, added_cols, removed_cols
+    return df2[added_mask], df1[removed_mask], added_cols, removed_cols
 #</editor-fold>
 
 # --- State Initialization ---
@@ -124,7 +107,6 @@ if 'report_buffer' not in st.session_state: st.session_state.report_buffer = Non
 
 # --- Core Functions ---
 def run_comparison_computation():
-    """Phase 1: Perform all computations in memory and store results."""
     status = st.status("Starting comparison...", expanded=True)
     all_results = []
     
@@ -197,8 +179,6 @@ if st.session_state.view_mode == 'results':
                 if res['rem_cols']: st.warning(f"🔴 Removed columns: {', '.join(res['rem_cols'])}")
                 if not res['added'].empty: st.markdown(f"🟢 **{len(res['added'])} Added Rows:**"); st.dataframe(res['added'])
                 if not res['removed'].empty: st.markdown(f"🔴 **{len(res['removed'])} Removed Rows:**"); st.dataframe(res['removed'])
-                
-                # The 'changed' rows section is no longer needed
 
     if st.session_state.report_buffer:
         st.download_button("📥 Download Full Report", st.session_state.report_buffer, "comparison_report.xlsx")
@@ -222,9 +202,15 @@ else:
         manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files)
 
         with st.expander("🔑 Enter Passwords (if needed)"):
-            all_files = left_files + right_files
-            for f in all_files:
-                st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_{f.name}")
+            # --- THIS IS THE FIX ---
+            # Create separate loops for OLD and NEW files to ensure unique keys.
+            st.markdown("###### OLD Files")
+            for f in left_files:
+                st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_old_{f.name}")
+            
+            st.markdown("###### NEW Files")
+            for f in right_files:
+                st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_new_{f.name}")
         
         st.button("🚀 Run Comparison", on_click=run_comparison_computation, type="primary", disabled=(not st.session_state.pairs))
     else:
