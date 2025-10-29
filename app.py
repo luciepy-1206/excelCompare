@@ -8,14 +8,12 @@ import msoffcrypto
 import io
 from openpyxl.styles import PatternFill
 import fitz  # PyMuPDF
-# Import Mito here if you are using it
-# from mitosheet.streamlit.v1 import spreadsheet
+import gc   # --- MEMORY MANAGEMENT --- Import Garbage Collector
 
 # --- Page Config ---
 st.set_page_config(page_title="📊📄 Unified Diff Manager", layout="wide")
 st.markdown("<style>section.main > div {padding-top: 1rem;}</style>", unsafe_allow_html=True)
 
-# --- All Helper Functions (no changes needed) ---
 #<editor-fold desc="Helper Functions">
 def normalize_filename(name: str):
     name = name.lower()
@@ -146,16 +144,22 @@ if 'report_buffer' not in st.session_state:
 
 # --- Computation Logic ---
 def run_comparison():
-    """Performs the heavy computation and stores results in session_state."""
     with st.spinner("Comparing files and generating report..."):
         all_results = []
         output_buffer = BytesIO()
+        summary_data = []
 
         with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+            # --- ROBUSTNESS FIX ---
+            # Create a placeholder sheet first. If the app crashes, this
+            # prevents the "At least one sheet must be visible" error.
+            pd.DataFrame([{"Status": "Starting..."}]).to_excel(writer, sheet_name="Summary", index=False)
+
             for i, (lf, rf) in enumerate(st.session_state.pairs, 1):
                 pair_result = {"pair_index": i, "lf_name": lf.name, "rf_name": rf.name, "sheets": [], "error": None}
                 
                 try:
+                    # ... (rest of the comparison logic is the same)
                     if lf.type != rf.type: raise ValueError("Mismatched file types")
                     
                     pwd_l = st.session_state.file_passwords.get(lf.name)
@@ -165,11 +169,15 @@ def run_comparison():
                     xls2 = pd.ExcelFile(decrypt_file_bytes(rf, pwd_r))
                     common_sheets = sorted(list(set(xls1.sheet_names) & set(xls2.sheet_names)))
                     
+                    pair_had_diffs = False
                     for sheet in common_sheets:
                         df1 = pd.read_excel(xls1, sheet_name=sheet)
                         df2 = pd.read_excel(xls2, sheet_name=sheet)
                         added, removed, changes, add_cols, rem_cols = compare_sheets(df1.copy(), df2.copy())
                         
+                        if changes or not added.empty or not removed.empty or add_cols or rem_cols:
+                            pair_had_diffs = True
+
                         pair_result["sheets"].append({
                             "name": sheet, "added": added, "removed": removed, 
                             "changes": changes, "add_cols": add_cols, "rem_cols": rem_cols
@@ -183,30 +191,37 @@ def run_comparison():
                             new_df = pd.DataFrame([c['new_row'] for c in changes]).reset_index(drop=True)
                             all_cols = sorted(list(set(old_df.columns) | set(new_df.columns)))
                             old_df, new_df = old_df.reindex(columns=all_cols, fill_value=""), new_df.reindex(columns=all_cols, fill_value="")
-
                             sheet_name = f"P{i}_{sheet}_Changed"[:31]
                             new_df.to_excel(writer, sheet_name=sheet_name, index=False)
                             ws = writer.sheets[sheet_name]
-                            
-                            # Highlight for Excel remains light green, as it's for a light-themed app
                             highlight_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-
                             for r_idx, row in new_df.iterrows():
                                 for c_idx, col_name in enumerate(new_df.columns, 1):
                                     if col_name not in rem_cols and row[col_name] != old_df.iloc[r_idx][col_name]:
                                         ws.cell(row=r_idx + 2, column=c_idx).fill = highlight_fill
+                    
+                    summary_data.append([lf.name, rf.name, "Differences Found" if pair_had_diffs else "No Differences"])
 
                 except Exception as e:
                     pair_result["error"] = str(e)
+                    summary_data.append([lf.name, rf.name, f"Error: {e}"])
                 
                 all_results.append(pair_result)
+
+                # --- MEMORY MANAGEMENT ---
+                # Explicitly call the garbage collector to free up memory after processing each large pair.
+                gc.collect()
+
+            # Overwrite the placeholder Summary sheet with the final summary
+            summary_df = pd.DataFrame(summary_data, columns=["Old File", "New File", "Status"])
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
 
         st.session_state.comparison_results = all_results
         st.session_state.report_buffer = output_buffer.getvalue()
         st.session_state.view_mode = 'results'
 
 def reset_view():
-    """Resets the application to its initial state."""
     st.session_state.view_mode = 'setup'
     st.session_state.comparison_results = None
     st.session_state.pairs = []
@@ -220,25 +235,15 @@ if st.session_state.view_mode == 'results':
     
     for result in st.session_state.comparison_results:
         st.markdown(f"--- \n ### {result['pair_index']}. Comparing `{result['lf_name']}` ↔ `{result['rf_name']}`")
-
         if result["error"]:
             st.error(f"❌ Error during comparison: {result['error']}")
             continue
-        
         for sheet_result in result["sheets"]:
-            is_diff = bool(
-                not sheet_result['added'].empty or 
-                not sheet_result['removed'].empty or 
-                sheet_result['changes'] or 
-                sheet_result['add_cols'] or 
-                sheet_result['rem_cols']
-            )
-            
+            is_diff = bool(not sheet_result['added'].empty or not sheet_result['removed'].empty or sheet_result['changes'] or sheet_result['add_cols'] or sheet_result['rem_cols'])
             with st.expander(f"▸ Sheet: `{sheet_result['name']}` {'(Has Differences)' if is_diff else '(No Differences)'}", expanded=is_diff):
                 if not is_diff:
                     st.success("✅ No differences found.")
                     continue
-
                 if sheet_result['add_cols']: st.info(f"🟢 Added columns: {', '.join(sheet_result['add_cols'])}")
                 if sheet_result['rem_cols']: st.warning(f"🔴 Removed columns: {', '.join(sheet_result['rem_cols'])}")
                 if not sheet_result['added'].empty:
@@ -251,53 +256,35 @@ if st.session_state.view_mode == 'results':
                     new_df = pd.DataFrame([c['new_row'] for c in sheet_result['changes']]).reset_index(drop=True)
                     all_cols = sorted(list(set(old_df.columns) | set(new_df.columns)))
                     old_df, new_df = old_df.reindex(columns=all_cols, fill_value=""), new_df.reindex(columns=all_cols, fill_value="")
-
                     def highlight_diffs(new_row):
                         old_row = old_df.iloc[new_row.name]
-                        # --- THIS IS THE COLOR CHANGE ---
-                        # Using a muted blue-grey, which works well in dark themes with white text.
                         highlight_color = '#334155' 
                         return [f'background-color: {highlight_color}' if new_row[col] != old_row[col] else '' for col in new_row.index]
-                    
                     st.dataframe(new_df.style.apply(highlight_diffs, axis=1))
 
-                    # --- YOUR MITO CODE GOES HERE ---
-                    # st.markdown("### Interactive Analysis")
-                    # spreadsheet(old_df, new_df, df_names=['Old Values', 'New Values'])
-
     if st.session_state.report_buffer:
-        st.download_button(
-            label="📥 Download Full Report as Excel",
-            data=st.session_state.report_buffer,
-            file_name="comparison_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        st.download_button(label="📥 Download Full Report as Excel", data=st.session_state.report_buffer, file_name="comparison_report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # --- PHASE 1: Setup View ---
 else:
     st.title("📊📄 Unified Diff & Highlight Manager")
     st.markdown("Upload files to compare. This tool automatically matches them and highlights all differences.")
-
     col1, col2 = st.columns(2)
     with col1:
         left_files = st.file_uploader("📂 Upload OLD files", type=["xlsx", "xls"], accept_multiple_files=True, key="old_files")
     with col2:
         right_files = st.file_uploader("📂 Upload NEW files", type=["xlsx", "xls"], accept_multiple_files=True, key="new_files")
-    
     if left_files and right_files:
         threshold = st.slider("Auto-match similarity threshold", 0.5, 1.0, 0.8, step=0.05)
         with st.expander("🔑 Enter Passwords (if needed)"):
             for f in left_files + right_files:
                 pwd = st.text_input(f"Password for **{f.name}**", value=st.session_state.file_passwords.get(f.name, ""), type="password", key=f"pwd_{f.name}")
                 st.session_state.file_passwords[f.name] = pwd
-        
         matched, unmatched_left, unmatched_right = auto_match(left_files, right_files, threshold)
         if matched:
             st.success(f"Auto-matched {len(matched)} pair(s):")
             for lf, rf, sc in matched: st.write(f"› {lf.name} ↔️ {rf.name} ({sc:.1%})")
-
         manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files)
-
         st.button("🚀 Run Comparison", on_click=run_comparison, type="primary", disabled=(not st.session_state.pairs))
     else:
         st.info("👆 Upload files to both OLD and NEW groups to begin.")
