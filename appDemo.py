@@ -8,7 +8,7 @@ import io
 from openpyxl.styles import PatternFill
 
 # --- Page Config ---
-st.set_page_config(page_title="📊🚀 Ultra-Fast Diff Manager", layout="wide")
+st.set_page_config(page_title="📊🚀 Smart Diff Manager", layout="wide")
 st.markdown("""
 <style>
     [data-theme="light"] { --highlight-background-color: #d4edda; }
@@ -16,7 +16,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Helper Functions (No changes needed in this section) ---
+# --- Helper Functions (Normalization is the key change) ---
 #<editor-fold desc="Helper Functions">
 def auto_match(left_files, right_files, threshold):
     potential_matches = []
@@ -73,21 +73,38 @@ def decrypt_file_bytes(uploaded_file, password=None):
         except msoffcrypto.exceptions.InvalidKeyError: raise ValueError("BAD_PASSWORD")
         except Exception as e: raise RuntimeError(f"File decryption failed: {e}")
 
-def normalize_df_fast(df):
-    df = df.fillna('').astype(str)
-    for col in df.columns:
-        df[col] = df[col].str.strip()
-    return df
+# --- KEY CHANGE: Smart Normalization for Boolean-like values ---
+def normalize_df_vectorized(df):
+    """A high-performance, vectorized function to clean and standardize the DataFrame."""
+    # Define comprehensive maps for all boolean-like values
+    true_map = {'TRUE', 'T', 'YES', 'Y', '1', '1.0', '✓'}
+    false_map = {'FALSE', 'F', 'NO', 'N', '0', '0.0', '✗', ''} # Empty string is now explicitly 'FALSE'
+
+    df_norm = df.copy()
+    for col in df_norm.columns:
+        # Vectorized conversion to string, stripping whitespace, and making uppercase
+        s = df_norm[col].fillna('').astype(str).str.strip().str.upper()
+        
+        # Vectorized replacement using boolean masks
+        df_norm[col] = pd.Series('OTHER', index=s.index) # Default value
+        df_norm.loc[s.isin(true_map), col] = 'TRUE'
+        df_norm.loc[s.isin(false_map), col] = 'FALSE'
+        # Keep original value if it's not in any map
+        df_norm.loc[df_norm[col] == 'OTHER', col] = s
+
+    return df_norm
 
 def compare_sheets_keyless(df1, df2):
+    """High-performance comparison using row hashing after smart normalization."""
     cols1, cols2 = set(df1.columns), set(df2.columns)
     added_cols, removed_cols = sorted(list(cols2 - cols1)), sorted(list(cols1 - cols2))
     
     if df1.empty: return df2, pd.DataFrame(columns=df1.columns), added_cols, removed_cols
     if df2.empty: return pd.DataFrame(columns=df2.columns), df1, added_cols, removed_cols
 
-    df1_norm = normalize_df_fast(df1.copy())
-    df2_norm = normalize_df_fast(df2.copy())
+    # Use the new, smart normalization function
+    df1_norm = normalize_df_vectorized(df1)
+    df2_norm = normalize_df_vectorized(df2)
 
     df1_hashes = pd.util.hash_pandas_object(df1_norm, index=False)
     df2_hashes = pd.util.hash_pandas_object(df2_norm, index=False)
@@ -185,8 +202,8 @@ if st.session_state.view_mode == 'results':
 
 # --- UI: PHASE 1 (SETUP) ---
 else:
-    st.title("📊🚀 Ultra-Fast Diff Manager")
-    st.markdown("Compare large Excel files instantly. Finds all added and removed rows.")
+    st.title("📊🚀 Smart Diff Manager")
+    st.markdown("Compare Excel files instantly. Handles different boolean formats (✓, 1, TRUE, etc.) automatically.")
 
     c1, c2 = st.columns(2)
     with c1: left_files = st.file_uploader("📂 Upload OLD files", type=["xlsx", "xls"], accept_multiple_files=True)
@@ -202,12 +219,9 @@ else:
         manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files)
 
         with st.expander("🔑 Enter Passwords (if needed)"):
-            # --- THIS IS THE FIX ---
-            # Create separate loops for OLD and NEW files to ensure unique keys.
             st.markdown("###### OLD Files")
             for f in left_files:
                 st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_old_{f.name}")
-            
             st.markdown("###### NEW Files")
             for f in right_files:
                 st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_new_{f.name}")
