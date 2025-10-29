@@ -3,3 +3,4 @@ pandas
 openpyxl
 streamlit-sortables
 msoffcrypto-tool
+PyMuPDF
