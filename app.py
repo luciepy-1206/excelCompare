@@ -15,7 +15,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Helper Functions (Normalization is the key change) ---
+# --- Helper Functions (Normalization and Pairing are the key changes) ---
 #<editor-fold desc="Helper Functions">
 def auto_match(left_files, right_files, threshold):
     potential_matches = []
@@ -37,10 +37,11 @@ def auto_match(left_files, right_files, threshold):
     return matched, unmatched_left, unmatched_right
 
 def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files):
-    st.subheader(f"🎛️ Manually Align Files")
+    st.subheader(f"🎛️ Manually Align Files (unpaired files will be ignored)")
     initial_left_names = [lf.name for lf, _, _ in matched] + [f.name for f in unmatched_left]
     initial_right_names = [rf.name for _, rf, _ in matched] + [f.name for f in unmatched_right]
 
+    # This logic correctly handles placeholder creation for the UI
     len_diff = len(initial_left_names) - len(initial_right_names)
     if len_diff > 0: initial_right_names.extend(["---"] * len_diff)
     elif len_diff < 0: initial_left_names.extend(["---"] * abs(len_diff))
@@ -53,9 +54,12 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
         
     left_dict = {f.name: f for f in left_files}
     right_dict = {f.name: f for f in right_files}
-    st.session_state.pairs = [(left_dict[l], right_dict[r]) for l, r in zip(sorted_left_names, sorted_right_names) if l != "---" and r != "---"]
-    st.success(f"✅ {len(st.session_state.pairs)} pairs formed for comparison.")
-    return st.session_state.pairs
+    
+    # THE FIX: Only create pairs where both sides are actual files, not placeholders.
+    pairs = [(left_dict[l], right_dict[r]) for l, r in zip(sorted_left_names, sorted_right_names) if l != "---" and r != "---"]
+    st.session_state.pairs = pairs
+    st.success(f"✅ {len(pairs)} pairs formed for comparison.")
+    return pairs
 
 def decrypt_file_bytes(uploaded_file, password=None):
     file_bytes = io.BytesIO(uploaded_file.getvalue())
@@ -77,11 +81,6 @@ def decrypt_file_bytes(uploaded_file, password=None):
 
 # --- THIS IS THE ROBUST, CORRECTED NORMALIZATION FUNCTION ---
 def normalize_df_advanced(df):
-    """
-    Cleans and standardizes the DataFrame with a robust two-pass approach.
-    1. First pass handles numeric rounding to eliminate float precision errors.
-    2. Second pass handles boolean/string standardization.
-    """
     df_norm = df.copy()
     
     # Pass 1: Numeric rounding
@@ -98,7 +97,6 @@ def normalize_df_advanced(df):
     false_map = {'FALSE', 'F', 'NO', 'N', '0', '0.0', '✗'}
 
     for col in df_norm.columns:
-        # Vectorized string operations for speed
         s = df_norm[col].str.strip().str.upper()
         
         is_true = s.isin(true_map)
@@ -110,7 +108,6 @@ def normalize_df_advanced(df):
     return df_norm
 
 def compare_sheets_keyless(df1, df2):
-    """High-performance comparison using row hashing after advanced normalization."""
     cols1, cols2 = set(df1.columns), set(df2.columns)
     added_cols, removed_cols = sorted(list(cols2 - cols1)), sorted(list(cols1 - cols2))
     
@@ -142,6 +139,10 @@ def run_comparison_computation():
     all_results = []
     
     try:
+        if not st.session_state.pairs:
+            status.update(label="No file pairs were formed. Please align files to compare.", state="error", expanded=True)
+            return
+
         for i, (lf, rf) in enumerate(st.session_state.pairs, 1):
             status.write(f"**Pair {i}: `{lf.name}` vs `{rf.name}`**")
             pair_result = {"pair_index": i, "lf_name": lf.name, "rf_name": rf.name, "sheets": [], "error": None}
@@ -149,16 +150,15 @@ def run_comparison_computation():
             try:
                 status.write("Reading and preparing files...")
                 
-                # Robustly read file based on extension
-                if lf.name.lower().endswith('.csv'):
-                    df1 = pd.read_csv(lf)
-                else:
-                    df1 = pd.read_excel(decrypt_file_bytes(lf, st.session_state.file_passwords.get(lf.name)))
-                
-                if rf.name.lower().endswith('.csv'):
-                    df2 = pd.read_csv(rf)
-                else:
-                    df2 = pd.read_excel(decrypt_file_bytes(rf, st.session_state.file_passwords.get(rf.name)))
+                # Simplified and robust file reading
+                def read_data(file_obj, password):
+                    if file_obj.name.lower().endswith('.csv'):
+                        return pd.read_csv(file_obj)
+                    else:
+                        return pd.read_excel(decrypt_file_bytes(file_obj, password))
+
+                df1 = read_data(lf, st.session_state.file_passwords.get(lf.name))
+                df2 = read_data(rf, st.session_state.file_passwords.get(rf.name))
                 
                 status.write("Comparing content...")
                 added, removed, add_cols, rem_cols = compare_sheets_keyless(df1, df2)
@@ -199,6 +199,7 @@ def generate_excel_report(all_results):
         if not any_diffs_found:
             pd.DataFrame({"Status": ["No differences found across all compared files."]}) \
               .to_excel(writer, sheet_name="Summary", index=False)
+
     return output_buffer.getvalue()
 
 def reset_view():
