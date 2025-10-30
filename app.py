@@ -5,7 +5,6 @@ from io import BytesIO
 from streamlit_sortables import sort_items
 import msoffcrypto
 import io
-from openpyxl.styles import PatternFill
 
 # --- Page Config ---
 st.set_page_config(page_title="📊🚀 Smart Diff Manager", layout="wide")
@@ -16,7 +15,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Helper Functions (manual_pairing is the key change) ---
+# --- Helper Functions (Normalization is the key change) ---
 #<editor-fold desc="Helper Functions">
 def auto_match(left_files, right_files, threshold):
     potential_matches = []
@@ -37,7 +36,6 @@ def auto_match(left_files, right_files, threshold):
     unmatched_right = [f for f in right_files if f not in used_right]
     return matched, unmatched_left, unmatched_right
 
-# --- THIS FUNCTION CONTAINS THE FIX ---
 def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files):
     st.subheader(f"🎛️ Manually Align Files")
     initial_left_names = [lf.name for lf, _, _ in matched] + [f.name for f in unmatched_left]
@@ -55,19 +53,19 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
         
     left_dict = {f.name: f for f in left_files}
     right_dict = {f.name: f for f in right_files}
-    pairs = [(left_dict[l], right_dict[r]) for l, r in zip(sorted_left_names, sorted_right_names) if l != "---" and r != "---"]
-    
-    st.session_state.pairs = pairs # Still set state for the computation function
-    st.success(f"✅ {len(pairs)} pairs formed for comparison.")
-    return pairs # THE FIX: Return the created pairs list directly.
+    st.session_state.pairs = [(left_dict[l], right_dict[r]) for l, r in zip(sorted_left_names, sorted_right_names) if l != "---" and r != "---"]
+    st.success(f"✅ {len(st.session_state.pairs)} pairs formed for comparison.")
+    return st.session_state.pairs
 
 def decrypt_file_bytes(uploaded_file, password=None):
     file_bytes = io.BytesIO(uploaded_file.getvalue())
     try:
+        # Try reading as Excel first
         pd.ExcelFile(file_bytes); file_bytes.seek(0); return file_bytes
     except Exception:
         file_bytes.seek(0)
         try:
+            # Handle encrypted files
             office_file = msoffcrypto.OfficeFile(file_bytes)
             if not office_file.is_encrypted(): return file_bytes
             if not password: raise ValueError("PASSWORD_REQUIRED")
@@ -77,29 +75,53 @@ def decrypt_file_bytes(uploaded_file, password=None):
         except msoffcrypto.exceptions.InvalidKeyError: raise ValueError("BAD_PASSWORD")
         except Exception as e: raise RuntimeError(f"File decryption failed: {e}")
 
-def normalize_df_vectorized(df):
+# --- KEY CHANGE: Advanced Normalization for Booleans AND Numeric Precision ---
+def normalize_df_advanced(df):
+    """
+    Cleans and standardizes the DataFrame with high performance.
+    - Handles boolean-like values.
+    - Rounds numeric values to handle floating-point precision issues.
+    """
+    df_norm = df.copy()
+    
     true_map = {'TRUE', 'T', 'YES', 'Y', '1', '1.0', '✓'}
     false_map = {'FALSE', 'F', 'NO', 'N', '0', '0.0', '✗', ''}
-
-    df_norm = df.copy()
+    
     for col in df_norm.columns:
-        s = df_norm[col].fillna('').astype(str).str.strip().str.upper()
-        # Create a Series with the original values for non-boolean cases
-        original_values = df_norm[col].astype(str).str.strip()
-        # Apply boolean normalization
-        is_bool = s.isin(true_map | false_map)
-        df_norm[col] = s.where(~is_bool, s.isin(true_map).map({True: 'TRUE', False: 'FALSE'}))
+        # Attempt to convert to numeric, but don't force it for text columns
+        numeric_col = pd.to_numeric(df_norm[col], errors='coerce')
+        
+        # If a column is mostly numeric, round it to handle float precision
+        if numeric_col.notna().sum() / len(df_norm.index.dropna()) > 0.5:
+             df_norm[col] = numeric_col.round(9)
+
+    # Now, convert everything to string for boolean and whitespace normalization
+    df_norm = df_norm.fillna('').astype(str)
+    
+    for col in df_norm.columns:
+        s = df_norm[col].str.strip().str.upper()
+        
+        is_true = s.isin(true_map)
+        is_false = s.isin(false_map)
+        
+        # Apply boolean normalization only to values that match
+        df_norm.loc[is_true, col] = 'TRUE'
+        df_norm.loc[is_false, col] = 'FALSE'
+
     return df_norm
 
+
 def compare_sheets_keyless(df1, df2):
+    """High-performance comparison using row hashing after advanced normalization."""
     cols1, cols2 = set(df1.columns), set(df2.columns)
     added_cols, removed_cols = sorted(list(cols2 - cols1)), sorted(list(cols1 - cols2))
     
     if df1.empty: return df2, pd.DataFrame(columns=df1.columns), added_cols, removed_cols
     if df2.empty: return pd.DataFrame(columns=df2.columns), df1, added_cols, removed_cols
 
-    df1_norm = normalize_df_vectorized(df1)
-    df2_norm = normalize_df_vectorized(df2)
+    # Use the new, advanced normalization function
+    df1_norm = normalize_df_advanced(df1)
+    df2_norm = normalize_df_advanced(df2)
 
     df1_hashes = pd.util.hash_pandas_object(df1_norm, index=False)
     df2_hashes = pd.util.hash_pandas_object(df2_norm, index=False)
@@ -129,14 +151,23 @@ def run_comparison_computation():
             
             try:
                 status.write("Decrypting and reading files...")
-                xls1 = pd.ExcelFile(decrypt_file_bytes(lf, st.session_state.file_passwords.get(lf.name)))
-                xls2 = pd.ExcelFile(decrypt_file_bytes(rf, st.session_state.file_passwords.get(rf.name)))
-                
-                common_sheets = sorted(list(set(xls1.sheet_names) & set(xls2.sheet_names)))
+                # Determine file type and read accordingly
+                if lf.name.lower().endswith('.csv'):
+                    xls1 = {'Sheet1': pd.read_csv(lf)}
+                    xls2 = {'Sheet1': pd.read_csv(rf)}
+                    common_sheets = ['Sheet1']
+                else:
+                    xls1_file = pd.ExcelFile(decrypt_file_bytes(lf, st.session_state.file_passwords.get(lf.name)))
+                    xls2_file = pd.ExcelFile(decrypt_file_bytes(rf, st.session_state.file_passwords.get(rf.name)))
+                    common_sheets = sorted(list(set(xls1_file.sheet_names) & set(xls2_file.sheet_names)))
                 
                 for sheet in common_sheets:
                     status.write(f"Comparing sheet: `{sheet}`...")
-                    df1, df2 = pd.read_excel(xls1, sheet_name=sheet), pd.read_excel(xls2, sheet_name=sheet)
+                    if lf.name.lower().endswith('.csv'):
+                        df1, df2 = xls1[sheet], xls2[sheet]
+                    else:
+                        df1, df2 = pd.read_excel(xls1_file, sheet_name=sheet), pd.read_excel(xls2_file, sheet_name=sheet)
+
                     added, removed, add_cols, rem_cols = compare_sheets_keyless(df1, df2)
                     
                     pair_result["sheets"].append({
@@ -208,11 +239,13 @@ if st.session_state.view_mode == 'results':
 # --- UI: PHASE 1 (SETUP) ---
 else:
     st.title("📊🚀 Smart Diff Manager")
-    st.markdown("Compare Excel files instantly. Handles different boolean formats (✓, 1, TRUE, etc.) automatically.")
+    st.markdown("Handles boolean formats (✓, 1, TRUE) and minor numeric differences automatically.")
 
+    # Added CSV to the list of accepted types
+    file_types = ["xlsx", "xls", "csv"]
     c1, c2 = st.columns(2)
-    with c1: left_files = st.file_uploader("📂 Upload OLD files", type=["xlsx", "xls"], accept_multiple_files=True)
-    with c2: right_files = st.file_uploader("📂 Upload NEW files", type=["xlsx", "xls"], accept_multiple_files=True)
+    with c1: left_files = st.file_uploader("📂 Upload OLD files", type=file_types, accept_multiple_files=True)
+    with c2: right_files = st.file_uploader("📂 Upload NEW files", type=file_types, accept_multiple_files=True)
     
     if left_files and right_files:
         st.subheader("1. Auto-Match Files")
@@ -221,10 +254,9 @@ else:
         if matched:
             st.success(f"Auto-matched {len(matched)} pair(s).")
 
-        # THE FIX: Capture the returned list to control the button state
         pairs_formed = manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files)
 
-        with st.expander("🔑 Enter Passwords (if needed)"):
+        with st.expander("🔑 Enter Passwords (if needed for .xlsx/.xls)"):
             st.markdown("###### OLD Files")
             for f in left_files:
                 st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_old_{f.name}")
@@ -232,7 +264,6 @@ else:
             for f in right_files:
                 st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_new_{f.name}")
         
-        # THE FIX: Use the locally captured list for the disabled check
         st.button("🚀 Run Comparison", on_click=run_comparison_computation, type="primary", disabled=(not pairs_formed))
     else:
-        st.info("👆 Upload files to both OLD and NEW groups to begin.")
+        st.info("👆 Upload Excel or CSV files to both groups to begin.")
