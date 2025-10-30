@@ -16,7 +16,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Helper Functions (No changes needed in this section) ---
+# --- Helper Functions (manual_pairing is the key change) ---
 #<editor-fold desc="Helper Functions">
 def auto_match(left_files, right_files, threshold):
     potential_matches = []
@@ -37,6 +37,7 @@ def auto_match(left_files, right_files, threshold):
     unmatched_right = [f for f in right_files if f not in used_right]
     return matched, unmatched_left, unmatched_right
 
+# --- THIS FUNCTION CONTAINS THE FIX ---
 def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files):
     st.subheader(f"🎛️ Manually Align Files")
     initial_left_names = [lf.name for lf, _, _ in matched] + [f.name for f in unmatched_left]
@@ -54,8 +55,11 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
         
     left_dict = {f.name: f for f in left_files}
     right_dict = {f.name: f for f in right_files}
-    st.session_state.pairs = [(left_dict[l], right_dict[r]) for l, r in zip(sorted_left_names, sorted_right_names) if l != "---" and r != "---"]
-    st.success(f"✅ {len(st.session_state.pairs)} pairs formed for comparison.")
+    pairs = [(left_dict[l], right_dict[r]) for l, r in zip(sorted_left_names, sorted_right_names) if l != "---" and r != "---"]
+    
+    st.session_state.pairs = pairs # Still set state for the computation function
+    st.success(f"✅ {len(pairs)} pairs formed for comparison.")
+    return pairs # THE FIX: Return the created pairs list directly.
 
 def decrypt_file_bytes(uploaded_file, password=None):
     file_bytes = io.BytesIO(uploaded_file.getvalue())
@@ -80,13 +84,11 @@ def normalize_df_vectorized(df):
     df_norm = df.copy()
     for col in df_norm.columns:
         s = df_norm[col].fillna('').astype(str).str.strip().str.upper()
-        
         # Create a Series with the original values for non-boolean cases
         original_values = df_norm[col].astype(str).str.strip()
-        
         # Apply boolean normalization
-        df_norm[col] = s.where(~s.isin(true_map | false_map), s.isin(true_map).map({True: 'TRUE', False: 'FALSE'}))
-
+        is_bool = s.isin(true_map | false_map)
+        df_norm[col] = s.where(~is_bool, s.isin(true_map).map({True: 'TRUE', False: 'FALSE'}))
     return df_norm
 
 def compare_sheets_keyless(df1, df2):
@@ -155,7 +157,6 @@ def run_comparison_computation():
     except Exception as e:
         status.update(label=f"An error occurred: {e}", state="error")
 
-# --- THIS FUNCTION CONTAINS THE FIX ---
 def generate_excel_report(all_results):
     output_buffer = BytesIO()
     with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
@@ -171,10 +172,9 @@ def generate_excel_report(all_results):
                     res['removed'].to_excel(writer, sheet_name=f"P{i}_{res['name']}_Removed"[:31], index=False)
                     any_diffs_found = True
         
-        # THE FIX: If no differences were written, create a summary sheet.
         if not any_diffs_found:
-            summary_df = pd.DataFrame({"Status": ["No differences found across all compared files."]})
-            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+            pd.DataFrame({"Status": ["No differences found across all compared files."]}) \
+              .to_excel(writer, sheet_name="Summary", index=False)
 
     return output_buffer.getvalue()
 
@@ -221,7 +221,8 @@ else:
         if matched:
             st.success(f"Auto-matched {len(matched)} pair(s).")
 
-        manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files)
+        # THE FIX: Capture the returned list to control the button state
+        pairs_formed = manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files)
 
         with st.expander("🔑 Enter Passwords (if needed)"):
             st.markdown("###### OLD Files")
@@ -231,6 +232,7 @@ else:
             for f in right_files:
                 st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_new_{f.name}")
         
-        st.button("🚀 Run Comparison", on_click=run_comparison_computation, type="primary", disabled=(not st.session_state.pairs))
+        # THE FIX: Use the locally captured list for the disabled check
+        st.button("🚀 Run Comparison", on_click=run_comparison_computation, type="primary", disabled=(not pairs_formed))
     else:
         st.info("👆 Upload files to both OLD and NEW groups to begin.")
