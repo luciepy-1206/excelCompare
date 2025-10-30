@@ -60,25 +60,20 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
 def decrypt_file_bytes(uploaded_file, password=None):
     file_bytes = io.BytesIO(uploaded_file.getvalue())
     try:
-        # Check if it's a valid Excel file first to avoid unnecessary decryption attempts
         pd.ExcelFile(file_bytes); file_bytes.seek(0); return file_bytes
     except Exception:
         file_bytes.seek(0)
         try:
             office_file = msoffcrypto.OfficeFile(file_bytes)
             if not office_file.is_encrypted():
-                # If not encrypted, it might be a CSV, so just return bytes
-                file_bytes.seek(0)
-                return file_bytes
+                file_bytes.seek(0); return file_bytes
             if not password: raise ValueError("PASSWORD_REQUIRED")
             decrypted_bytes = io.BytesIO()
             office_file.load_key(password=password); office_file.decrypt(decrypted_bytes)
             decrypted_bytes.seek(0); return decrypted_bytes
         except msoffcrypto.exceptions.InvalidKeyError: raise ValueError("BAD_PASSWORD")
-        except Exception: # Broad exception for other parsing issues, including CSV
-            file_bytes.seek(0)
-            return file_bytes
-
+        except Exception:
+            file_bytes.seek(0); return file_bytes
 
 # --- THIS IS THE ROBUST, CORRECTED NORMALIZATION FUNCTION ---
 def normalize_df_advanced(df):
@@ -91,27 +86,24 @@ def normalize_df_advanced(df):
     
     # Pass 1: Numeric rounding
     for col in df_norm.columns:
-        # Use errors='coerce' to turn non-numbers into NaT/NaN
         numeric_col = pd.to_numeric(df_norm[col], errors='coerce')
-        # Create a mask to identify which cells were successfully converted to numbers
         numeric_mask = numeric_col.notna()
-        # If there are any numbers in the column, round them in place
         if numeric_mask.any():
             df_norm.loc[numeric_mask, col] = numeric_col[numeric_mask].round(9)
 
-    # Pass 2: Convert entire dataframe to string and then normalize booleans
+    # Pass 2: Convert to string and normalize booleans
     df_norm = df_norm.fillna('').astype(str)
     
     true_map = {'TRUE', 'T', 'YES', 'Y', '1', '1.0', '✓'}
     false_map = {'FALSE', 'F', 'NO', 'N', '0', '0.0', '✗'}
 
     for col in df_norm.columns:
+        # Vectorized string operations for speed
         s = df_norm[col].str.strip().str.upper()
         
         is_true = s.isin(true_map)
         is_false = s.isin(false_map)
         
-        # Apply boolean normalization only to values that match
         df_norm.loc[is_true, col] = 'TRUE'
         df_norm.loc[is_false, col] = 'FALSE'
         
@@ -155,38 +147,26 @@ def run_comparison_computation():
             pair_result = {"pair_index": i, "lf_name": lf.name, "rf_name": rf.name, "sheets": [], "error": None}
             
             try:
-                status.write("Reading and decrypting files...")
+                status.write("Reading and preparing files...")
                 
-                lf_bytes = decrypt_file_bytes(lf, st.session_state.file_passwords.get(lf.name))
-                rf_bytes = decrypt_file_bytes(rf, st.session_state.file_passwords.get(rf.name))
-
-                # Universal reader for Excel or CSV
-                def read_file(file_bytes, file_name):
-                    if file_name.lower().endswith('.csv'):
-                        return {'Sheet1': pd.read_csv(file_bytes)}
-                    else:
-                        return pd.ExcelFile(file_bytes)
-
-                xls1 = read_file(lf_bytes, lf.name)
-                xls2 = read_file(rf_bytes, rf.name)
-
-                # Determine sheet names based on file type
-                sheets1 = xls1.sheet_names if isinstance(xls1, pd.ExcelFile) else list(xls1.keys())
-                sheets2 = xls2.sheet_names if isinstance(xls2, pd.ExcelFile) else list(xls2.keys())
+                # Robustly read file based on extension
+                if lf.name.lower().endswith('.csv'):
+                    df1 = pd.read_csv(lf)
+                else:
+                    df1 = pd.read_excel(decrypt_file_bytes(lf, st.session_state.file_passwords.get(lf.name)))
                 
-                common_sheets = sorted(list(set(sheets1) & set(sheets2)))
+                if rf.name.lower().endswith('.csv'):
+                    df2 = pd.read_csv(rf)
+                else:
+                    df2 = pd.read_excel(decrypt_file_bytes(rf, st.session_state.file_passwords.get(rf.name)))
                 
-                for sheet in common_sheets:
-                    status.write(f"Comparing sheet: `{sheet}`...")
-                    df1 = pd.read_excel(xls1, sheet_name=sheet) if isinstance(xls1, pd.ExcelFile) else xls1[sheet]
-                    df2 = pd.read_excel(xls2, sheet_name=sheet) if isinstance(xls2, pd.ExcelFile) else xls2[sheet]
-
-                    added, removed, add_cols, rem_cols = compare_sheets_keyless(df1, df2)
-                    
-                    pair_result["sheets"].append({
-                        "name": sheet, "added": added, "removed": removed,
-                        "add_cols": add_cols, "rem_cols": rem_cols
-                    })
+                status.write("Comparing content...")
+                added, removed, add_cols, rem_cols = compare_sheets_keyless(df1, df2)
+                
+                pair_result["sheets"].append({
+                    "name": "File Content", "added": added, "removed": removed,
+                    "add_cols": add_cols, "rem_cols": rem_cols
+                })
             except Exception as e:
                 pair_result["error"] = str(e)
             
@@ -210,16 +190,15 @@ def generate_excel_report(all_results):
             i = result["pair_index"]
             for res in result["sheets"]:
                 if not res['added'].empty:
-                    res['added'].to_excel(writer, sheet_name=f"P{i}_{res['name']}_Added"[:31], index=False)
+                    res['added'].to_excel(writer, sheet_name=f"P{i}_Added"[:31], index=False)
                     any_diffs_found = True
                 if not res['removed'].empty:
-                    res['removed'].to_excel(writer, sheet_name=f"P{i}_{res['name']}_Removed"[:31], index=False)
+                    res['removed'].to_excel(writer, sheet_name=f"P{i}_Removed"[:31], index=False)
                     any_diffs_found = True
         
         if not any_diffs_found:
             pd.DataFrame({"Status": ["No differences found across all compared files."]}) \
               .to_excel(writer, sheet_name="Summary", index=False)
-
     return output_buffer.getvalue()
 
 def reset_view():
@@ -237,7 +216,7 @@ if st.session_state.view_mode == 'results':
         
         for res in result["sheets"]:
             is_diff = bool(not res['added'].empty or not res['removed'].empty or res['add_cols'] or res['rem_cols'])
-            with st.expander(f"▸ Sheet: `{res['name']}` {'(Differences Found)' if is_diff else '(No Differences)'}", expanded=is_diff):
+            with st.expander(f"▸ File Content Comparison {'(Differences Found)' if is_diff else '(No Differences)'}", expanded=is_diff):
                 if not is_diff:
                     st.success("✅ No differences found."); continue
 
