@@ -8,47 +8,40 @@ import io
 from openpyxl.styles import PatternFill
 
 # --- Page Config ---
-st.set_page_config(page_title="📊🚀 Ultra-Fast Diff Manager", layout="wide")
-st.markdown("<style>section.main > div {padding-top: 1rem;}</style>", unsafe_allow_html=True)
+st.set_page_config(page_title="📊🚀 Smart Diff Manager", layout="wide")
+st.markdown("""
+<style>
+    [data-theme="light"] { --highlight-background-color: #d4edda; }
+    [data-theme="dark"] { --highlight-background-color: #334155; }
+</style>
+""", unsafe_allow_html=True)
 
-# --- Helper Functions (Correction is in auto_match) ---
+# --- Helper Functions (No changes needed in this section) ---
 #<editor-fold desc="Helper Functions">
-
-# --- THIS FUNCTION CONTAINS THE FIX ---
 def auto_match(left_files, right_files, threshold):
-    """
-    Uses the fast and standard difflib for filename matching.
-    The sort key is explicitly set to prevent the TypeError.
-    """
     potential_matches = []
     for lf in left_files:
         lf_norm = lf.name.lower()
         for rf in right_files:
             rf_norm = rf.name.lower()
-            # SequenceMatcher is the reliable and fast choice for this task
             score = SequenceMatcher(None, lf_norm, rf_norm).ratio()
             potential_matches.append((score, lf, rf))
-    
-    # THE FIX: Sort *only* by the first item in the tuple (the score).
-    # This prevents Python from trying to compare the UploadedFile objects.
     potential_matches.sort(key=lambda x: x[0], reverse=True)
     
     matched, used_left, used_right = [], set(), set()
     for score, lf, rf in potential_matches:
         if score >= threshold and lf not in used_left and rf not in used_right:
             matched.append((lf, rf, score))
-            used_left.add(lf)
-            used_right.add(rf)
-            
+            used_left.add(lf); used_right.add(rf)
     unmatched_left = [f for f in left_files if f not in used_left]
     unmatched_right = [f for f in right_files if f not in used_right]
     return matched, unmatched_left, unmatched_right
 
 def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files):
-    st.subheader(f"🎛️ 2. Manually Align Files")
+    st.subheader(f"🎛️ Manually Align Files")
     initial_left_names = [lf.name for lf, _, _ in matched] + [f.name for f in unmatched_left]
     initial_right_names = [rf.name for _, rf, _ in matched] + [f.name for f in unmatched_right]
-    
+
     len_diff = len(initial_left_names) - len(initial_right_names)
     if len_diff > 0: initial_right_names.extend(["---"] * len_diff)
     elif len_diff < 0: initial_left_names.extend(["---"] * abs(len_diff))
@@ -57,7 +50,7 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
     with c1:
         st.markdown(f"#### 📂 OLD Files"); sorted_left_names = sort_items(initial_left_names, key="old_files")
     with c2:
-        st.markdown(f"#### 🗂️ NEW Files"); sorted_right_names = sort_items(initial_right_names, key="new_files")
+        st.markdown(f"#### 𗂂 NEW Files"); sorted_right_names = sort_items(initial_right_names, key="new_files")
         
     left_dict = {f.name: f for f in left_files}
     right_dict = {f.name: f for f in right_files}
@@ -80,59 +73,39 @@ def decrypt_file_bytes(uploaded_file, password=None):
         except msoffcrypto.exceptions.InvalidKeyError: raise ValueError("BAD_PASSWORD")
         except Exception as e: raise RuntimeError(f"File decryption failed: {e}")
 
-def normalize_df_fast(df):
-    df = df.fillna('').astype(str)
-    for col in df.columns:
-        df[col] = df[col].str.strip()
-    return df
+def normalize_df_vectorized(df):
+    true_map = {'TRUE', 'T', 'YES', 'Y', '1', '1.0', '✓'}
+    false_map = {'FALSE', 'F', 'NO', 'N', '0', '0.0', '✗', ''}
 
-def compare_sheets_fast(df1, df2, key_columns):
+    df_norm = df.copy()
+    for col in df_norm.columns:
+        s = df_norm[col].fillna('').astype(str).str.strip().str.upper()
+        
+        # Create a Series with the original values for non-boolean cases
+        original_values = df_norm[col].astype(str).str.strip()
+        
+        # Apply boolean normalization
+        df_norm[col] = s.where(~s.isin(true_map | false_map), s.isin(true_map).map({True: 'TRUE', False: 'FALSE'}))
+
+    return df_norm
+
+def compare_sheets_keyless(df1, df2):
     cols1, cols2 = set(df1.columns), set(df2.columns)
     added_cols, removed_cols = sorted(list(cols2 - cols1)), sorted(list(cols1 - cols2))
     
-    for key in key_columns:
-        if key not in cols1 or key not in cols2:
-            raise ValueError(f"Key column '{key}' not found in both files.")
+    if df1.empty: return df2, pd.DataFrame(columns=df1.columns), added_cols, removed_cols
+    if df2.empty: return pd.DataFrame(columns=df2.columns), df1, added_cols, removed_cols
 
-    df1_norm = normalize_df_fast(df1.copy())
-    df2_norm = normalize_df_fast(df2.copy())
+    df1_norm = normalize_df_vectorized(df1)
+    df2_norm = normalize_df_vectorized(df2)
 
-    # Set index for faster lookups later
-    df1_norm = df1_norm.set_index(key_columns)
-    df2_norm = df2_norm.set_index(key_columns)
+    df1_hashes = pd.util.hash_pandas_object(df1_norm, index=False)
+    df2_hashes = pd.util.hash_pandas_object(df2_norm, index=False)
 
-    # Find indices for each category
-    added_indices = df2_norm.index.difference(df1_norm.index)
-    removed_indices = df1_norm.index.difference(df2_norm.index)
-    common_indices = df1_norm.index.intersection(df2_norm.index)
+    added_mask = ~df2_hashes.isin(df1_hashes)
+    removed_mask = ~df1_hashes.isin(df2_hashes)
 
-    # Get original rows
-    added_rows = df2.set_index(key_columns).loc[added_indices].reset_index()
-    removed_rows = df1.set_index(key_columns).loc[removed_indices].reset_index()
-
-    # Compare common rows for changes
-    if not common_indices.empty:
-        df1_common = df1_norm.loc[common_indices]
-        df2_common = df2_norm.loc[common_indices]
-        
-        # Ensure columns are in the same order for comparison
-        compare_cols = [c for c in df1.columns if c not in key_columns]
-        df1_common = df1_common[compare_cols]
-        df2_common = df2_common[compare_cols]
-
-        # The comparison is a fast, vectorized operation
-        diff_mask = (df1_common.values != df2_common.values).any(axis=1)
-        
-        if diff_mask.any():
-            changed_indices = common_indices[diff_mask]
-            changed_old = df1.set_index(key_columns).loc[changed_indices].reset_index()
-            changed_new = df2.set_index(key_columns).loc[changed_indices].reset_index()
-        else:
-            changed_old, changed_new = pd.DataFrame(columns=df1.columns), pd.DataFrame(columns=df2.columns)
-    else:
-        changed_old, changed_new = pd.DataFrame(columns=df1.columns), pd.DataFrame(columns=df2.columns)
-
-    return added_rows, removed_rows, changed_old, changed_new, added_cols, removed_cols
+    return df2[added_mask], df1[removed_mask], added_cols, removed_cols
 #</editor-fold>
 
 # --- State Initialization ---
@@ -141,14 +114,9 @@ if 'comparison_results' not in st.session_state: st.session_state.comparison_res
 if "file_passwords" not in st.session_state: st.session_state.file_passwords = {}
 if 'pairs' not in st.session_state: st.session_state.pairs = []
 if 'report_buffer' not in st.session_state: st.session_state.report_buffer = None
-if 'key_columns_str' not in st.session_state: st.session_state.key_columns_str = ""
 
 # --- Core Functions ---
 def run_comparison_computation():
-    key_columns = [key.strip() for key in st.session_state.key_columns_str.split(',') if key.strip()]
-    if not key_columns:
-        st.error("Please provide at least one Key Column to identify rows."); return
-
     status = st.status("Starting comparison...", expanded=True)
     all_results = []
     
@@ -167,11 +135,10 @@ def run_comparison_computation():
                 for sheet in common_sheets:
                     status.write(f"Comparing sheet: `{sheet}`...")
                     df1, df2 = pd.read_excel(xls1, sheet_name=sheet), pd.read_excel(xls2, sheet_name=sheet)
-                    added, removed, changed_old, changed_new, add_cols, rem_cols = compare_sheets_fast(df1, df2, key_columns)
+                    added, removed, add_cols, rem_cols = compare_sheets_keyless(df1, df2)
                     
                     pair_result["sheets"].append({
-                        "name": sheet, "added": added, "removed": removed, 
-                        "changed_old": changed_old, "changed_new": changed_new,
+                        "name": sheet, "added": added, "removed": removed,
                         "add_cols": add_cols, "rem_cols": rem_cols
                     })
             except Exception as e:
@@ -188,16 +155,27 @@ def run_comparison_computation():
     except Exception as e:
         status.update(label=f"An error occurred: {e}", state="error")
 
+# --- THIS FUNCTION CONTAINS THE FIX ---
 def generate_excel_report(all_results):
     output_buffer = BytesIO()
     with pd.ExcelWriter(output_buffer, engine="openpyxl") as writer:
+        any_diffs_found = False
         for result in all_results:
             if result["error"]: continue
             i = result["pair_index"]
             for res in result["sheets"]:
-                if not res['added'].empty: res['added'].to_excel(writer, sheet_name=f"P{i}_{res['name']}_Added"[:31], index=False)
-                if not res['removed'].empty: res['removed'].to_excel(writer, sheet_name=f"P{i}_{res['name']}_Removed"[:31], index=False)
-                if not res['changed_new'].empty: res['changed_new'].to_excel(writer, sheet_name=f"P{i}_{res['name']}_Changed"[:31], index=False)
+                if not res['added'].empty:
+                    res['added'].to_excel(writer, sheet_name=f"P{i}_{res['name']}_Added"[:31], index=False)
+                    any_diffs_found = True
+                if not res['removed'].empty:
+                    res['removed'].to_excel(writer, sheet_name=f"P{i}_{res['name']}_Removed"[:31], index=False)
+                    any_diffs_found = True
+        
+        # THE FIX: If no differences were written, create a summary sheet.
+        if not any_diffs_found:
+            summary_df = pd.DataFrame({"Status": ["No differences found across all compared files."]})
+            summary_df.to_excel(writer, sheet_name="Summary", index=False)
+
     return output_buffer.getvalue()
 
 def reset_view():
@@ -214,7 +192,7 @@ if st.session_state.view_mode == 'results':
             st.error(f"❌ Error: {result['error']}"); continue
         
         for res in result["sheets"]:
-            is_diff = bool(not res['added'].empty or not res['removed'].empty or not res['changed_new'].empty or res['add_cols'] or res['rem_cols'])
+            is_diff = bool(not res['added'].empty or not res['removed'].empty or res['add_cols'] or res['rem_cols'])
             with st.expander(f"▸ Sheet: `{res['name']}` {'(Differences Found)' if is_diff else '(No Differences)'}", expanded=is_diff):
                 if not is_diff:
                     st.success("✅ No differences found."); continue
@@ -223,40 +201,20 @@ if st.session_state.view_mode == 'results':
                 if res['rem_cols']: st.warning(f"🔴 Removed columns: {', '.join(res['rem_cols'])}")
                 if not res['added'].empty: st.markdown(f"🟢 **{len(res['added'])} Added Rows:**"); st.dataframe(res['added'])
                 if not res['removed'].empty: st.markdown(f"🔴 **{len(res['removed'])} Removed Rows:**"); st.dataframe(res['removed'])
-                if not res['changed_new'].empty:
-                    st.markdown(f"🟡 **{len(res['changed_new'])} Changed Rows:**")
-                    old_df, new_df = res['changed_old'], res['changed_new']
-                    
-                    # Align indices for correct row-wise comparison in highlight function
-                    old_df = old_df.set_index(st.session_state.key_columns_str.split(','))
-                    new_df_styled = new_df.set_index(st.session_state.key_columns_str.split(','))
-
-                    def highlight_diffs(row):
-                        old_row = old_df.loc[row.name]
-                        return [f'background-color: #334155' if str(row[col]) != str(old_row[col]) else '' for col in row.index]
-
-                    st.dataframe(new_df_styled.style.apply(highlight_diffs, axis=1))
 
     if st.session_state.report_buffer:
         st.download_button("📥 Download Full Report", st.session_state.report_buffer, "comparison_report.xlsx")
 
 # --- UI: PHASE 1 (SETUP) ---
 else:
-    st.title("📊🚀 Ultra-Fast Diff Manager")
-    st.markdown("Compare large Excel files instantly. Provide key columns to match rows.")
+    st.title("📊🚀 Smart Diff Manager")
+    st.markdown("Compare Excel files instantly. Handles different boolean formats (✓, 1, TRUE, etc.) automatically.")
 
     c1, c2 = st.columns(2)
     with c1: left_files = st.file_uploader("📂 Upload OLD files", type=["xlsx", "xls"], accept_multiple_files=True)
     with c2: right_files = st.file_uploader("📂 Upload NEW files", type=["xlsx", "xls"], accept_multiple_files=True)
     
     if left_files and right_files:
-        st.subheader("⚙️ Configuration")
-        st.text_input(
-            "**Key Columns** (comma-separated, required)", 
-            placeholder="e.g., ID, Employee Code",
-            help="The column names that uniquely identify a row.",
-            key='key_columns_str'
-        )
         st.subheader("1. Auto-Match Files")
         threshold = st.slider("File name similarity", 0.1, 1.0, 0.8, step=0.05)
         matched, unmatched_left, unmatched_right = auto_match(left_files, right_files, threshold)
@@ -266,10 +224,13 @@ else:
         manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_files)
 
         with st.expander("🔑 Enter Passwords (if needed)"):
-            all_files = left_files + right_files
-            for f in all_files:
-                st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_{f.name}")
+            st.markdown("###### OLD Files")
+            for f in left_files:
+                st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_old_{f.name}")
+            st.markdown("###### NEW Files")
+            for f in right_files:
+                st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_new_{f.name}")
         
-        st.button("🚀 Run Comparison", on_click=run_comparison_computation, type="primary", disabled=(not st.session_state.pairs or not st.session_state.key_columns_str))
+        st.button("🚀 Run Comparison", on_click=run_comparison_computation, type="primary", disabled=(not st.session_state.pairs))
     else:
         st.info("👆 Upload files to both OLD and NEW groups to begin.")
