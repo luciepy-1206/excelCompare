@@ -5,7 +5,6 @@ from io import BytesIO
 from streamlit_sortables import sort_items
 import msoffcrypto
 import io
-from openpyxl.styles import PatternFill
 
 # --- Page Config ---
 st.set_page_config(page_title="📊🚀 Smart Diff Manager", layout="wide")
@@ -16,7 +15,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Helper Functions ---
+# --- Helper Functions (No changes needed) ---
 #<editor-fold desc="Helper Functions">
 def auto_match(left_files, right_files, threshold):
     potential_matches = []
@@ -95,21 +94,27 @@ def normalize_df_advanced(df):
         df_norm.loc[is_false, col] = 'FALSE'
     return df_norm
 
+def compare_sheets_keyless(df1, df2):
+    cols1, cols2 = set(df1.columns), set(df2.columns)
+    added_cols, removed_cols = sorted(list(cols2 - cols1)), sorted(list(cols1 - cols2))
+    if df1.empty: return df2, pd.DataFrame(columns=df1.columns), added_cols, removed_cols
+    if df2.empty: return pd.DataFrame(columns=df2.columns), df1, added_cols, removed_cols
+    df1_norm, df2_norm = normalize_df_advanced(df1), normalize_df_advanced(df2)
+    df1_hashes = pd.util.hash_pandas_object(df1_norm, index=False)
+    df2_hashes = pd.util.hash_pandas_object(df2_norm, index=False)
+    added_mask = ~df2_hashes.isin(df1_hashes)
+    removed_mask = ~df1_hashes.isin(df2_hashes)
+    return df2[added_mask], df1[removed_mask], added_cols, removed_cols
+
 def compare_sheets_key_based(df1, df2, key_columns):
-    """High-performance comparison that identifies Added, Removed, and Changed rows."""
     cols1, cols2 = set(df1.columns), set(df2.columns)
     added_cols, removed_cols = sorted(list(cols2 - cols1)), sorted(list(cols1 - cols2))
     
-    for key in key_columns:
-        if key not in cols1 or key not in cols2:
-            raise ValueError(f"Key column '{key}' not found in both files.")
-
     df1_norm = normalize_df_advanced(df1)
     df2_norm = normalize_df_advanced(df2)
 
     merged = pd.merge(df1_norm, df2_norm, on=key_columns, how='outer', suffixes=('_old', '_new'), indicator=True)
-
-    # Use original dataframes for the final output
+    
     added_rows = df2[merged['_merge'] == 'right_only']
     removed_rows = df1[merged['_merge'] == 'left_only']
     
@@ -133,7 +138,6 @@ def compare_sheets_key_based(df1, df2, key_columns):
 
 # --- State Initialization ---
 if 'view_mode' not in st.session_state: st.session_state.view_mode = 'setup'
-# ... (rest of state initialization is the same)
 if 'comparison_results' not in st.session_state: st.session_state.comparison_results = None
 if "file_passwords" not in st.session_state: st.session_state.file_passwords = {}
 if 'pairs' not in st.session_state: st.session_state.pairs = []
@@ -143,9 +147,6 @@ if 'key_columns_str' not in st.session_state: st.session_state.key_columns_str =
 # --- Core Functions ---
 def run_comparison_computation():
     key_columns = [key.strip() for key in st.session_state.key_columns_str.split(',') if key.strip()]
-    if not key_columns:
-        st.error("Please provide at least one Key Column to identify rows."); return
-
     status = st.status("Starting comparison...", expanded=True)
     all_results = []
     
@@ -160,20 +161,32 @@ def run_comparison_computation():
             try:
                 status.write("Reading and preparing files...")
                 def read_data(file_obj, password):
-                    if file_obj.name.lower().endswith('.csv'):
-                        return pd.read_csv(file_obj)
-                    else:
-                        return pd.read_excel(decrypt_file_bytes(file_obj, password))
+                    if file_obj.name.lower().endswith('.csv'): return pd.read_csv(file_obj)
+                    else: return pd.read_excel(decrypt_file_bytes(file_obj, password))
 
                 df1, df2 = read_data(lf, st.session_state.file_passwords.get(lf.name)), read_data(rf, st.session_state.file_passwords.get(rf.name))
                 
-                status.write("Comparing content...")
-                added, removed, changed_old, changed_new, add_cols, rem_cols = compare_sheets_key_based(df1, df2, key_columns)
+                # --- THIS IS THE NEW SMART-SWITCHING LOGIC ---
+                use_key_based = False
+                if key_columns:
+                    if set(key_columns).issubset(df1.columns) and set(key_columns).issubset(df2.columns):
+                        use_key_based = True
+                
+                if use_key_based:
+                    status.write("Comparing content using Key Columns...")
+                    added, removed, changed_old, changed_new, add_cols, rem_cols = compare_sheets_key_based(df1, df2, key_columns)
+                    comparison_mode = 'key-based'
+                else:
+                    status.write("Key columns not found or not provided. Using keyless comparison...")
+                    added, removed, add_cols, rem_cols = compare_sheets_keyless(df1, df2)
+                    changed_old, changed_new = pd.DataFrame(), pd.DataFrame() # Empty placeholders
+                    comparison_mode = 'keyless'
                 
                 pair_result["sheets"].append({
                     "name": "File Content", "added": added, "removed": removed,
                     "changed_old": changed_old, "changed_new": changed_new,
-                    "add_cols": add_cols, "rem_cols": rem_cols
+                    "add_cols": add_cols, "rem_cols": rem_cols,
+                    "mode": comparison_mode
                 })
             except Exception as e:
                 pair_result["error"] = str(e)
@@ -225,23 +238,24 @@ if st.session_state.view_mode == 'results':
                 if not is_diff:
                     st.success("✅ No differences found."); continue
 
+                if res['mode'] == 'keyless' and (not res['added'].empty or not res['removed'].empty):
+                    st.info("Keyless comparison performed. Changes to rows are shown as one 'Removed' and one 'Added' row.")
+
                 if res['add_cols']: st.info(f"🟢 Added columns: {', '.join(res['add_cols'])}")
                 if res['rem_cols']: st.warning(f"🔴 Removed columns: {', '.join(res['rem_cols'])}")
                 if not res['added'].empty: st.markdown(f"🟢 **{len(res['added'])} Added Rows:**"); st.dataframe(res['added'])
                 if not res['removed'].empty: st.markdown(f"🔴 **{len(res['removed'])} Removed Rows:**"); st.dataframe(res['removed'])
+                
+                # This section only shows if key-based comparison was successful
                 if not res['changed_new'].empty:
                     st.markdown(f"🟡 **{len(res['changed_new'])} Changed Rows:**")
-                    
-                    key_cols = st.session_state.key_columns_str.split(',')
+                    key_cols = [k.strip() for k in st.session_state.key_columns_str.split(',')]
                     old_df_indexed = res['changed_old'].set_index(key_cols)
                     new_df_styled = res['changed_new'].set_index(key_cols)
 
                     def highlight_diffs(row):
                         old_row = old_df_indexed.loc[row.name]
-                        # Normalize values before final comparison for highlighting
-                        old_row_norm = normalize_df_advanced(old_row.to_frame().T).iloc[0]
-                        new_row_norm = normalize_df_advanced(row.to_frame().T).iloc[0]
-                        return [f'background-color: var(--highlight-background-color)' if str(new_row_norm[col]) != str(old_row_norm[col]) else '' for col in row.index]
+                        return [f'background-color: var(--highlight-background-color)' if str(row[col]) != str(old_row[col]) else '' for col in row.index]
 
                     st.dataframe(new_df_styled.style.apply(highlight_diffs, axis=1))
 
@@ -251,7 +265,7 @@ if st.session_state.view_mode == 'results':
 # --- UI: PHASE 1 (SETUP) ---
 else:
     st.title("📊🚀 Smart Diff Manager")
-    st.markdown("Compare files by providing a **Key Column** (like an ID) to find changes, additions, and deletions.")
+    st.markdown("Compare files, with optional **Key Columns** to find specific changes.")
     
     file_types = ["xlsx", "xls", "csv"]
     c1, c2 = st.columns(2)
@@ -259,11 +273,11 @@ else:
     with c2: right_files = st.file_uploader("📂 Upload NEW files", type=file_types, accept_multiple_files=True)
     
     if left_files and right_files:
-        st.subheader("⚙️ Configuration (Required)")
+        st.subheader("⚙️ Configuration (Optional)")
         st.text_input(
             "**Key Columns** (comma-separated)", 
             placeholder="e.g., emplid, Transaction ID",
-            help="Enter the column name(s) that uniquely identify a row.",
+            help="Provide unique ID column(s) to find and highlight changed rows. If blank or not found, only added/removed rows will be shown.",
             key='key_columns_str'
         )
 
@@ -282,7 +296,7 @@ else:
 
         st.subheader("3. Final Comparison Queue")
         if st.session_state.pairs:
-            st.info(f"{len(st.session_state.pairs)} pair(s) will be compared:")
+            st.info(f"{len(st.session_state.pairs)} pair(s) will be compared.")
         else:
             st.warning("No pairs formed.")
 
@@ -294,6 +308,6 @@ else:
             for f in right_files:
                 st.session_state.file_passwords[f.name] = st.text_input(f"Password for **{f.name}**", type="password", key=f"pwd_new_{f.name}")
         
-        st.button("🚀 Run Comparison", on_click=run_comparison_computation, type="primary", disabled=(not st.session_state.pairs or not st.session_state.key_columns_str))
+        st.button("🚀 Run Comparison", on_click=run_comparison_computation, type="primary", disabled=(not st.session_state.pairs))
     else:
         st.info("👆 Upload files to both groups to begin.")
