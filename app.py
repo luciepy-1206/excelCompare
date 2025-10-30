@@ -15,7 +15,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Helper Functions (Normalization and Pairing are the key changes) ---
+# --- Helper Functions (Normalization is the key change) ---
 #<editor-fold desc="Helper Functions">
 def auto_match(left_files, right_files, threshold):
     potential_matches = []
@@ -41,7 +41,6 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
     initial_left_names = [lf.name for lf, _, _ in matched] + [f.name for f in unmatched_left]
     initial_right_names = [rf.name for _, rf, _ in matched] + [f.name for f in unmatched_right]
 
-    # This logic correctly handles placeholder creation for the UI
     len_diff = len(initial_left_names) - len(initial_right_names)
     if len_diff > 0: initial_right_names.extend(["---"] * len_diff)
     elif len_diff < 0: initial_left_names.extend(["---"] * abs(len_diff))
@@ -55,7 +54,6 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
     left_dict = {f.name: f for f in left_files}
     right_dict = {f.name: f for f in right_files}
     
-    # THE FIX: Only create pairs where both sides are actual files, not placeholders.
     pairs = [(left_dict[l], right_dict[r]) for l, r in zip(sorted_left_names, sorted_right_names) if l != "---" and r != "---"]
     st.session_state.pairs = pairs
     st.success(f"✅ {len(pairs)} pairs formed for comparison.")
@@ -80,34 +78,42 @@ def decrypt_file_bytes(uploaded_file, password=None):
             file_bytes.seek(0); return file_bytes
 
 # --- THIS IS THE ROBUST, CORRECTED NORMALIZATION FUNCTION ---
-def normalize_df_advanced(df):
-    df_norm = df.copy()
-    
-    # Pass 1: Numeric rounding
-    for col in df_norm.columns:
-        numeric_col = pd.to_numeric(df_norm[col], errors='coerce')
-        numeric_mask = numeric_col.notna()
-        if numeric_mask.any():
-            df_norm.loc[numeric_mask, col] = numeric_col[numeric_mask].round(9)
-
-    # Pass 2: Convert to string and normalize booleans
-    df_norm = df_norm.fillna('').astype(str)
-    
+def sanitize_value(x):
+    """A robust function to clean and standardize a single cell value."""
+    # Define boolean maps
     true_map = {'TRUE', 'T', 'YES', 'Y', '1', '1.0', '✓'}
     false_map = {'FALSE', 'F', 'NO', 'N', '0', '0.0', '✗'}
 
-    for col in df_norm.columns:
-        s = df_norm[col].str.strip().str.upper()
-        
-        is_true = s.isin(true_map)
-        is_false = s.isin(false_map)
-        
-        df_norm.loc[is_true, col] = 'TRUE'
-        df_norm.loc[is_false, col] = 'FALSE'
-        
-    return df_norm
+    # If it's already a number (int, float), round it
+    if isinstance(x, (int, float)):
+        return round(x, 9)
+
+    # Convert to string for all other operations
+    s = str(x).strip()
+    s_upper = s.upper()
+
+    # Check for boolean representation
+    if s_upper in true_map:
+        return "TRUE"
+    if s_upper in false_map:
+        return "FALSE"
+
+    # Try to convert to a number and round it (catches numbers stored as text)
+    try:
+        return round(float(s), 9)
+    except (ValueError, TypeError):
+        # If it's not a number, it's a string. Clean it.
+        # This removes encoded characters like the `_x000d_` you found
+        if isinstance(s, str):
+            return s.replace('_x000d_', '').replace('\n', ' ').replace('\r', ' ')
+        return s
+
+def normalize_df_advanced(df):
+    """Applies the robust sanitizer to every cell in the DataFrame."""
+    return df.applymap(sanitize_value)
 
 def compare_sheets_keyless(df1, df2):
+    """High-performance comparison using row hashing after advanced normalization."""
     cols1, cols2 = set(df1.columns), set(df2.columns)
     added_cols, removed_cols = sorted(list(cols2 - cols1)), sorted(list(cols1 - cols2))
     
@@ -140,8 +146,7 @@ def run_comparison_computation():
     
     try:
         if not st.session_state.pairs:
-            status.update(label="No file pairs were formed. Please align files to compare.", state="error", expanded=True)
-            return
+            status.update(label="No file pairs were formed. Please align files to compare.", state="error"); return
 
         for i, (lf, rf) in enumerate(st.session_state.pairs, 1):
             status.write(f"**Pair {i}: `{lf.name}` vs `{rf.name}`**")
@@ -149,8 +154,6 @@ def run_comparison_computation():
             
             try:
                 status.write("Reading and preparing files...")
-                
-                # Simplified and robust file reading
                 def read_data(file_obj, password):
                     if file_obj.name.lower().endswith('.csv'):
                         return pd.read_csv(file_obj)
@@ -190,16 +193,13 @@ def generate_excel_report(all_results):
             i = result["pair_index"]
             for res in result["sheets"]:
                 if not res['added'].empty:
-                    res['added'].to_excel(writer, sheet_name=f"P{i}_Added"[:31], index=False)
-                    any_diffs_found = True
+                    res['added'].to_excel(writer, sheet_name=f"P{i}_Added"[:31], index=False); any_diffs_found = True
                 if not res['removed'].empty:
-                    res['removed'].to_excel(writer, sheet_name=f"P{i}_Removed"[:31], index=False)
-                    any_diffs_found = True
+                    res['removed'].to_excel(writer, sheet_name=f"P{i}_Removed"[:31], index=False); any_diffs_found = True
         
         if not any_diffs_found:
             pd.DataFrame({"Status": ["No differences found across all compared files."]}) \
               .to_excel(writer, sheet_name="Summary", index=False)
-
     return output_buffer.getvalue()
 
 def reset_view():
