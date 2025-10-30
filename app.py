@@ -60,44 +60,51 @@ def manual_pairing(matched, unmatched_left, unmatched_right, left_files, right_f
 def decrypt_file_bytes(uploaded_file, password=None):
     file_bytes = io.BytesIO(uploaded_file.getvalue())
     try:
-        # Try reading as Excel first
+        # Check if it's a valid Excel file first to avoid unnecessary decryption attempts
         pd.ExcelFile(file_bytes); file_bytes.seek(0); return file_bytes
     except Exception:
         file_bytes.seek(0)
         try:
-            # Handle encrypted files
             office_file = msoffcrypto.OfficeFile(file_bytes)
-            if not office_file.is_encrypted(): return file_bytes
+            if not office_file.is_encrypted():
+                # If not encrypted, it might be a CSV, so just return bytes
+                file_bytes.seek(0)
+                return file_bytes
             if not password: raise ValueError("PASSWORD_REQUIRED")
             decrypted_bytes = io.BytesIO()
             office_file.load_key(password=password); office_file.decrypt(decrypted_bytes)
             decrypted_bytes.seek(0); return decrypted_bytes
         except msoffcrypto.exceptions.InvalidKeyError: raise ValueError("BAD_PASSWORD")
-        except Exception as e: raise RuntimeError(f"File decryption failed: {e}")
+        except Exception: # Broad exception for other parsing issues, including CSV
+            file_bytes.seek(0)
+            return file_bytes
 
-# --- KEY CHANGE: Advanced Normalization for Booleans AND Numeric Precision ---
+
+# --- THIS IS THE ROBUST, CORRECTED NORMALIZATION FUNCTION ---
 def normalize_df_advanced(df):
     """
-    Cleans and standardizes the DataFrame with high performance.
-    - Handles boolean-like values.
-    - Rounds numeric values to handle floating-point precision issues.
+    Cleans and standardizes the DataFrame with a robust two-pass approach.
+    1. First pass handles numeric rounding to eliminate float precision errors.
+    2. Second pass handles boolean/string standardization.
     """
     df_norm = df.copy()
     
-    true_map = {'TRUE', 'T', 'YES', 'Y', '1', '1.0', '✓'}
-    false_map = {'FALSE', 'F', 'NO', 'N', '0', '0.0', '✗', ''}
-    
+    # Pass 1: Numeric rounding
     for col in df_norm.columns:
-        # Attempt to convert to numeric, but don't force it for text columns
+        # Use errors='coerce' to turn non-numbers into NaT/NaN
         numeric_col = pd.to_numeric(df_norm[col], errors='coerce')
-        
-        # If a column is mostly numeric, round it to handle float precision
-        if numeric_col.notna().sum() / len(df_norm.index.dropna()) > 0.5:
-             df_norm[col] = numeric_col.round(9)
+        # Create a mask to identify which cells were successfully converted to numbers
+        numeric_mask = numeric_col.notna()
+        # If there are any numbers in the column, round them in place
+        if numeric_mask.any():
+            df_norm.loc[numeric_mask, col] = numeric_col[numeric_mask].round(9)
 
-    # Now, convert everything to string for boolean and whitespace normalization
+    # Pass 2: Convert entire dataframe to string and then normalize booleans
     df_norm = df_norm.fillna('').astype(str)
     
+    true_map = {'TRUE', 'T', 'YES', 'Y', '1', '1.0', '✓'}
+    false_map = {'FALSE', 'F', 'NO', 'N', '0', '0.0', '✗'}
+
     for col in df_norm.columns:
         s = df_norm[col].str.strip().str.upper()
         
@@ -107,9 +114,8 @@ def normalize_df_advanced(df):
         # Apply boolean normalization only to values that match
         df_norm.loc[is_true, col] = 'TRUE'
         df_norm.loc[is_false, col] = 'FALSE'
-
+        
     return df_norm
-
 
 def compare_sheets_keyless(df1, df2):
     """High-performance comparison using row hashing after advanced normalization."""
@@ -119,7 +125,6 @@ def compare_sheets_keyless(df1, df2):
     if df1.empty: return df2, pd.DataFrame(columns=df1.columns), added_cols, removed_cols
     if df2.empty: return pd.DataFrame(columns=df2.columns), df1, added_cols, removed_cols
 
-    # Use the new, advanced normalization function
     df1_norm = normalize_df_advanced(df1)
     df2_norm = normalize_df_advanced(df2)
 
@@ -150,23 +155,31 @@ def run_comparison_computation():
             pair_result = {"pair_index": i, "lf_name": lf.name, "rf_name": rf.name, "sheets": [], "error": None}
             
             try:
-                status.write("Decrypting and reading files...")
-                # Determine file type and read accordingly
-                if lf.name.lower().endswith('.csv'):
-                    xls1 = {'Sheet1': pd.read_csv(lf)}
-                    xls2 = {'Sheet1': pd.read_csv(rf)}
-                    common_sheets = ['Sheet1']
-                else:
-                    xls1_file = pd.ExcelFile(decrypt_file_bytes(lf, st.session_state.file_passwords.get(lf.name)))
-                    xls2_file = pd.ExcelFile(decrypt_file_bytes(rf, st.session_state.file_passwords.get(rf.name)))
-                    common_sheets = sorted(list(set(xls1_file.sheet_names) & set(xls2_file.sheet_names)))
+                status.write("Reading and decrypting files...")
+                
+                lf_bytes = decrypt_file_bytes(lf, st.session_state.file_passwords.get(lf.name))
+                rf_bytes = decrypt_file_bytes(rf, st.session_state.file_passwords.get(rf.name))
+
+                # Universal reader for Excel or CSV
+                def read_file(file_bytes, file_name):
+                    if file_name.lower().endswith('.csv'):
+                        return {'Sheet1': pd.read_csv(file_bytes)}
+                    else:
+                        return pd.ExcelFile(file_bytes)
+
+                xls1 = read_file(lf_bytes, lf.name)
+                xls2 = read_file(rf_bytes, rf.name)
+
+                # Determine sheet names based on file type
+                sheets1 = xls1.sheet_names if isinstance(xls1, pd.ExcelFile) else list(xls1.keys())
+                sheets2 = xls2.sheet_names if isinstance(xls2, pd.ExcelFile) else list(xls2.keys())
+                
+                common_sheets = sorted(list(set(sheets1) & set(sheets2)))
                 
                 for sheet in common_sheets:
                     status.write(f"Comparing sheet: `{sheet}`...")
-                    if lf.name.lower().endswith('.csv'):
-                        df1, df2 = xls1[sheet], xls2[sheet]
-                    else:
-                        df1, df2 = pd.read_excel(xls1_file, sheet_name=sheet), pd.read_excel(xls2_file, sheet_name=sheet)
+                    df1 = pd.read_excel(xls1, sheet_name=sheet) if isinstance(xls1, pd.ExcelFile) else xls1[sheet]
+                    df2 = pd.read_excel(xls2, sheet_name=sheet) if isinstance(xls2, pd.ExcelFile) else xls2[sheet]
 
                     added, removed, add_cols, rem_cols = compare_sheets_keyless(df1, df2)
                     
@@ -240,8 +253,7 @@ if st.session_state.view_mode == 'results':
 else:
     st.title("📊🚀 Smart Diff Manager")
     st.markdown("Handles boolean formats (✓, 1, TRUE) and minor numeric differences automatically.")
-
-    # Added CSV to the list of accepted types
+    
     file_types = ["xlsx", "xls", "csv"]
     c1, c2 = st.columns(2)
     with c1: left_files = st.file_uploader("📂 Upload OLD files", type=file_types, accept_multiple_files=True)
