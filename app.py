@@ -109,7 +109,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     d.columns = d.columns.map(str)
     for c in d.columns:
         d[c] = d[c].astype(str).apply(normalize_logical)
-    return d
+    return d.copy()
 
 # ----------------------------------------------------------------------
 # SMART HEADER DETECTION - Find key columns ANYWHERE in the row
@@ -254,17 +254,21 @@ def read_visible_sheets_with_header_detection(
 # KEY SELECTION - Find best key that exists in both files
 # ----------------------------------------------------------------------
 
+from difflib import SequenceMatcher
+
 def find_best_valid_key(df1: pd.DataFrame, df2: pd.DataFrame, keys: List[str]) -> Tuple[List[str], str]:
     """
     Find the best valid key column that exists in both dataframes.
-    Now supports partial matches like 'emplid_0' ↔ 'emplid'.
+    - Matches column names case-insensitively
+    - Ignores trailing _0/_1 suffixes
+    - Requires at least 80% similarity to be considered a match
     """
     if not keys:
         return [], "No keys provided"
 
-    def norm(s): 
+    def norm(s: str) -> str:
         s = str(s).strip().lower()
-        s = re.sub(r'(_\\d+)+$', '', s)  # remove trailing _0, _1 etc.
+        s = re.sub(r'(_\\d+)+$', '', s)  # remove trailing _0/_1
         return re.sub(r'[^a-z0-9]', '', s)
 
     norm1 = {norm(c): c for c in df1.columns}
@@ -276,27 +280,33 @@ def find_best_valid_key(df1: pd.DataFrame, df2: pd.DataFrame, keys: List[str]) -
 
     for k in keys:
         nk = norm(k)
-        # First try exact match
-        if nk in norm1 and nk in norm2:
-            actual_col = norm1[nk]
-        else:
-            # Try partial match (e.g. emplid matches emplid_0)
-            candidates1 = [c for n, c in norm1.items() if nk in n or n in nk]
-            candidates2 = [c for n, c in norm2.items() if nk in n or n in nk]
-            if not (candidates1 and candidates2):
-                continue
-            actual_col = candidates1[0]  # pick first matching column
+        matched_col = None
+        match_score = 0
 
-        try:
-            unique1 = df1[actual_col].fillna("").astype(str).nunique()
-            unique2 = df2[actual_col].fillna("").astype(str).nunique()
-            uniqueness = (unique1 / max(1, len(df1)) + unique2 / max(1, len(df2))) / 2
-            if uniqueness > best_uniqueness:
-                best_uniqueness = uniqueness
-                best_key = [actual_col]
-                best_key_name = k
-        except Exception:
-            continue
+        # Try to find best match in both dfs with similarity >= 0.8
+        for n1, c1 in norm1.items():
+            ratio1 = SequenceMatcher(None, nk, n1).ratio()
+            if ratio1 < 0.8:
+                continue
+            for n2, c2 in norm2.items():
+                ratio2 = SequenceMatcher(None, nk, n2).ratio()
+                if ratio2 < 0.8:
+                    continue
+                if (ratio1 + ratio2) / 2 > match_score:
+                    match_score = (ratio1 + ratio2) / 2
+                    matched_col = c1
+
+        if matched_col:
+            try:
+                unique1 = df1[matched_col].fillna("").astype(str).nunique()
+                unique2 = df2[matched_col].fillna("").astype(str).nunique()
+                uniqueness = (unique1 / max(1, len(df1)) + unique2 / max(1, len(df2))) / 2
+                if uniqueness > best_uniqueness:
+                    best_uniqueness = uniqueness
+                    best_key = [matched_col]
+                    best_key_name = k
+            except Exception:
+                continue
 
     if best_key:
         return best_key, f"Key: '{best_key_name}' ({best_uniqueness:.0%} unique)"
