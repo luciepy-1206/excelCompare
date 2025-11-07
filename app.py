@@ -68,12 +68,35 @@ def normalize_colname(name: str) -> str:
 
 
 def normalize_logical(v):
-    """Normalize various representations of boolean values to TRUE/FALSE"""
+    """
+    Normalize various representations of boolean and numeric values for comparison.
+    - TRUE/FALSE handling stays the same
+    - Numeric values like 123.0 vs 123 are unified
+    """
+    if pd.isna(v) or v == "":
+        return ""
+
+    s = str(v).strip().upper()
+
+    # Boolean normalization
     t = {"TRUE","T","YES","Y","1","1.0","CHECK","CHECKED","CHECKMARK","✓","✔","ON","ENABLED","ACTIVE"}
     f = {"FALSE","F","NO","N","0","0.0","CROSS","UNCHECKED","✗","✘","X","OFF","DISABLED","INACTIVE"}
-    s = str(v).strip().upper()
     if s in t: return "TRUE"
     if s in f: return "FALSE"
+
+    # --- Numeric normalization ---
+    try:
+        # Replace commas with dots just in case locale uses comma decimals
+        sn = s.replace(",", ".")
+        num = float(sn)
+        # If integer-valued, cast to int string
+        if abs(num - int(num)) < 1e-9:
+            return str(int(num))
+        # Otherwise, keep up to one decimal (remove trailing zeroes)
+        return re.sub(r'\\.0+$', '', str(num))
+    except Exception:
+        pass  # not numeric, continue below
+
     return s
 
 
@@ -232,32 +255,49 @@ def read_visible_sheets_with_header_detection(
 # ----------------------------------------------------------------------
 
 def find_best_valid_key(df1: pd.DataFrame, df2: pd.DataFrame, keys: List[str]) -> Tuple[List[str], str]:
+    """
+    Find the best valid key column that exists in both dataframes.
+    Now supports partial matches like 'emplid_0' ↔ 'emplid'.
+    """
     if not keys:
         return [], "No keys provided"
-    norm1 = {normalize_colname(c): c for c in df1.columns}
-    norm2 = {normalize_colname(c): c for c in df2.columns}
+
+    def norm(s): 
+        s = str(s).strip().lower()
+        s = re.sub(r'(_\\d+)+$', '', s)  # remove trailing _0, _1 etc.
+        return re.sub(r'[^a-z0-9]', '', s)
+
+    norm1 = {norm(c): c for c in df1.columns}
+    norm2 = {norm(c): c for c in df2.columns}
+
     best_key = None
     best_uniqueness = 0
     best_key_name = None
+
     for k in keys:
-        k_stripped = k.strip()
-        if not k_stripped:
-            continue
-        nk = normalize_colname(k_stripped)
+        nk = norm(k)
+        # First try exact match
         if nk in norm1 and nk in norm2:
             actual_col = norm1[nk]
-            try:
-                unique1 = df1[actual_col].fillna("").astype(str).nunique()
-                unique2 = df2[actual_col].fillna("").astype(str).nunique()
-                uniqueness1 = unique1 / max(1, len(df1))
-                uniqueness2 = unique2 / max(1, len(df2))
-                avg_uniqueness = (uniqueness1 + uniqueness2) / 2
-                if avg_uniqueness > best_uniqueness:
-                    best_uniqueness = avg_uniqueness
-                    best_key = [actual_col]
-                    best_key_name = k_stripped
-            except Exception:
+        else:
+            # Try partial match (e.g. emplid matches emplid_0)
+            candidates1 = [c for n, c in norm1.items() if nk in n or n in nk]
+            candidates2 = [c for n, c in norm2.items() if nk in n or n in nk]
+            if not (candidates1 and candidates2):
                 continue
+            actual_col = candidates1[0]  # pick first matching column
+
+        try:
+            unique1 = df1[actual_col].fillna("").astype(str).nunique()
+            unique2 = df2[actual_col].fillna("").astype(str).nunique()
+            uniqueness = (unique1 / max(1, len(df1)) + unique2 / max(1, len(df2))) / 2
+            if uniqueness > best_uniqueness:
+                best_uniqueness = uniqueness
+                best_key = [actual_col]
+                best_key_name = k
+        except Exception:
+            continue
+
     if best_key:
         return best_key, f"Key: '{best_key_name}' ({best_uniqueness:.0%} unique)"
     return [], "No valid keys found"
