@@ -37,25 +37,30 @@ st.markdown(
 # ----------------------------------------------------------------------
 def decrypt_file(uploaded_file, password: Optional[str] = DEFAULT_PASSWORD) -> BytesIO:
     fb = BytesIO(uploaded_file.getvalue())
+    fb.seek(0)  # Reset before checks
+    
+    # Quick check if file is Excel openable without decryption
     try:
         pd.ExcelFile(fb)
         fb.seek(0)
         return fb
     except Exception:
         fb.seek(0)
+    
+    try:
         office = msoffcrypto.OfficeFile(fb)
         if not office.is_encrypted():
             fb.seek(0)
             return fb
         dec = BytesIO()
-        try:
-            office.load_key(password=password)
-            office.decrypt(dec)
-            dec.seek(0)
-            return dec
-        except Exception:
-            fb.seek(0)
-            return fb
+        office.load_key(password=password)
+        office.decrypt(dec)
+        dec.seek(0)
+        return dec
+    except Exception:
+        fb.seek(0)
+        return fb
+
 
 
 # ----------------------------------------------------------------------
