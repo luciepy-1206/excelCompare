@@ -414,14 +414,17 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame) -> int:
 def _read_sheets_cached(
     file_bytes_raw: bytes,
     key_columns_tuple: tuple,
+    header_overrides_tuple: tuple = (),  # ((sheet_name, row_idx), ...)
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, int]]:
     """
     Reads all visible sheets once, detects headers, returns DataFrames.
     Cached by raw file bytes hash – avoids re-reading on every Streamlit rerun.
-    Previously each sheet was read 2-3 times; now it's read exactly ONCE.
+    header_overrides_tuple: per-sheet manual header row (0-indexed).
+    When set for a sheet, auto-detection is skipped entirely.
     """
     file_bytes = BytesIO(file_bytes_raw)
     key_columns = list(key_columns_tuple)
+    header_overrides: Dict[str, int] = dict(header_overrides_tuple)
 
     try:
         wb = load_workbook(file_bytes, data_only=True)
@@ -456,8 +459,10 @@ def _read_sheets_cached(
             if len(visible_col_indices) < df_raw.shape[1]:
                 df_raw = df_raw.iloc[:, visible_col_indices].copy()
 
-            # Detect header row
-            if key_columns:
+            # Detect header row — manual override takes priority
+            if sh in header_overrides:
+                header_row = header_overrides[sh]
+            elif key_columns:
                 header_row = find_header_row_with_keys(df_raw, key_columns)
             else:
                 header_row = detect_header_row_heuristic(df_raw)
@@ -497,9 +502,11 @@ def _read_sheets_cached(
 def read_visible_sheets_with_header_detection(
     file_bytes: BytesIO,
     key_columns: List[str] = None,
+    header_overrides: Dict[str, int] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, int]]:
     raw = file_bytes.read()
-    return _read_sheets_cached(raw, tuple(key_columns or []))
+    overrides_tuple = tuple(sorted((header_overrides or {}).items()))
+    return _read_sheets_cached(raw, tuple(key_columns or []), overrides_tuple)
 
 
 # ─────────────────────────────────────────────
@@ -809,6 +816,58 @@ with cfg_col3:
     threshold = st.slider("Match threshold", 0.5, 1.0, 0.85, 0.05,
                           help="Minimum similarity score for auto-pairing files")
 
+# ── Header Row Overrides (shown only when files uploaded)
+if left or right:
+    with st.expander("🔢 Header Row Overrides (fix merged-cell / wrong header issues)", expanded=False):
+        st.markdown(
+            '<div style="color:#7888a8;font-size:0.82rem;margin-bottom:0.75rem">'
+            'If a sheet has merged cells or a multi-row title above the real header, '
+            'set the exact row number here. <b>Row 1 = first row of the sheet</b> (default). '
+            'Leave blank to use auto-detection.</div>',
+            unsafe_allow_html=True,
+        )
+        # Collect all unique sheet names from uploaded files
+        all_sheet_names: list[str] = []
+        for uf in (left or []) + (right or []):
+            try:
+                from openpyxl import load_workbook as _lw
+                wb_tmp = _lw(BytesIO(uf.read()), read_only=True)
+                uf.seek(0)
+                for sh in wb_tmp.sheetnames:
+                    if sh not in all_sheet_names:
+                        all_sheet_names.append(sh)
+            except Exception:
+                uf.seek(0)
+
+        if not all_sheet_names:
+            st.caption("Upload files above to see sheet names.")
+        else:
+            if "header_overrides" not in st.session_state:
+                st.session_state.header_overrides = {}
+
+            # Show one number_input per sheet in a compact grid
+            cols_per_row = 3
+            sheet_chunks = [all_sheet_names[i:i+cols_per_row]
+                            for i in range(0, len(all_sheet_names), cols_per_row)]
+            for chunk in sheet_chunks:
+                grid = st.columns(cols_per_row)
+                for col, sh in zip(grid, chunk):
+                    with col:
+                        current = st.session_state.header_overrides.get(sh, None)
+                        val = st.number_input(
+                            f'"{sh}"',
+                            min_value=1, max_value=100,
+                            value=int(current) if current is not None else 1,
+                            step=1,
+                            key=f"hdr_{sh}",
+                            help=f"Header row for sheet '{sh}' (1 = first row)",
+                        )
+                        st.session_state.header_overrides[sh] = val
+
+            if st.button("↺ Reset all to auto-detect", key="reset_overrides"):
+                st.session_state.header_overrides = {}
+                st.rerun()
+
 # ── Step 3: Match & Run
 if left and right:
     def comparable(n, ignore):
@@ -947,7 +1006,15 @@ if left and right:
                 decL = decrypt_file(lf)
                 decR = decrypt_file(rf)
 
-                shL, header_rows_old = read_visible_sheets_with_header_detection(decL, key_columns=keys)
+                # Apply manual header overrides (convert 1-based UI input to 0-based index)
+                header_overrides = {
+                    sh: (row - 1)
+                    for sh, row in st.session_state.get("header_overrides", {}).items()
+                    if row is not None
+                }
+                shL, header_rows_old = read_visible_sheets_with_header_detection(
+                    decL, key_columns=keys, header_overrides=header_overrides
+                )
 
                 # Align NEW sheets to OLD header rows & column names
                 shR: Dict[str, pd.DataFrame] = {}
@@ -964,7 +1031,8 @@ if left and right:
                     if sh not in new_sheet_names:
                         missing_in_new.append(sh)
                         continue
-                    hr_old = header_rows_old.get(sh, 0)
+                    # Use override if set, else use auto-detected row from OLD
+                    hr_old = header_overrides.get(sh, header_rows_old.get(sh, 0))
                     try:
                         decR.seek(0)
                         df_new_raw = pd.read_excel(decR, sheet_name=sh, header=None, engine="openpyxl")
