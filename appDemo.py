@@ -951,23 +951,43 @@ if left and right:
 
                 # Align NEW sheets to OLD header rows & column names
                 shR: Dict[str, pd.DataFrame] = {}
+                missing_in_new: List[str] = []
+                missing_in_old: List[str] = []
+
+                # Get sheet names present in the NEW file
+                decR.seek(0)
+                wb_new = load_workbook(decR, read_only=True, data_only=True)
+                new_sheet_names = set(wb_new.sheetnames)
+
+                # Sheets in OLD but not in NEW
                 for sh in shL:
+                    if sh not in new_sheet_names:
+                        missing_in_new.append(sh)
+                        continue
                     hr_old = header_rows_old.get(sh, 0)
-                    decR.seek(0)
-                    df_new_raw = pd.read_excel(decR, sheet_name=sh, header=None, engine="openpyxl")
-                    if hr_old < len(df_new_raw):
-                        new_cols = df_new_raw.iloc[hr_old].tolist()
-                        df_new   = df_new_raw.iloc[hr_old + 1:].reset_index(drop=True).copy()
-                        df_new.columns = new_cols
-                    else:
-                        df_new = pd.read_excel(decR, sheet_name=sh, header=0, engine="openpyxl")
                     try:
-                        df_new.columns = align_new_columns_to_reference(
-                            list(df_new.columns), list(shL[sh].columns)
-                        )
-                    except Exception:
-                        df_new.columns = [str(c) for c in df_new.columns]
-                    shR[sh] = df_new.astype(str)
+                        decR.seek(0)
+                        df_new_raw = pd.read_excel(decR, sheet_name=sh, header=None, engine="openpyxl")
+                        if hr_old < len(df_new_raw):
+                            new_cols = df_new_raw.iloc[hr_old].tolist()
+                            df_new   = df_new_raw.iloc[hr_old + 1:].reset_index(drop=True).copy()
+                            df_new.columns = new_cols
+                        else:
+                            df_new = pd.read_excel(decR, sheet_name=sh, header=0, engine="openpyxl")
+                        try:
+                            df_new.columns = align_new_columns_to_reference(
+                                list(df_new.columns), list(shL[sh].columns)
+                            )
+                        except Exception:
+                            df_new.columns = [str(c) for c in df_new.columns]
+                        shR[sh] = df_new.astype(str)
+                    except Exception as sheet_err:
+                        missing_in_new.append(sh)
+
+                # Sheets in NEW but not in OLD
+                for sh in new_sheet_names:
+                    if sh not in shL:
+                        missing_in_old.append(sh)
 
             except Exception as e:
                 import traceback
@@ -1004,26 +1024,31 @@ if left and right:
                     changed_sheets.append((sh, co, cn, add, rem, use_key, key_desc,
                                            is_trunc, old_rows, new_rows))
 
-            if changed_sheets:
-                files_with_changes.append((i + 1, lf.name, rf.name, changed_sheets))
+            # Always record the pair so missing-sheet notices are shown
+            files_with_changes.append((i + 1, lf.name, rf.name, changed_sheets,
+                                       missing_in_new, missing_in_old))
 
             prog.progress((i + 1) / len(matched), text=f"Done {i+1}/{len(matched)}")
 
         prog.empty()
 
         # ── Results ──────────────────────────────
-        if not files_with_changes:
-            if len(matched) == 0:
-                st.markdown(
-                    '<div class="warn-box">⚠️ No pairs were compared — '
-                    'use Manual Pairing above to pair files with different names.</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f'<div class="success-box">✅ All {len(matched)} file pair(s) are identical.</div>',
-                    unsafe_allow_html=True,
-                )
+        truly_identical = all(
+            not cs and not mn and not mo
+            for _, _, _, cs, mn, mo in files_with_changes
+        ) if files_with_changes else False
+
+        if len(matched) == 0:
+            st.markdown(
+                '<div class="warn-box">⚠️ No pairs were compared — '
+                'use Manual Pairing above to pair files with different names.</div>',
+                unsafe_allow_html=True,
+            )
+        elif truly_identical:
+            st.markdown(
+                f'<div class="success-box">✅ All {len(matched)} file pair(s) are identical.</div>',
+                unsafe_allow_html=True,
+            )
         else:
             st.markdown(
                 f'<div class="metric-row">'
@@ -1033,7 +1058,7 @@ if left and right:
                 unsafe_allow_html=True,
             )
 
-            for file_num, old_name, new_name, changed_sheets in files_with_changes:
+            for file_num, old_name, new_name, changed_sheets, missing_in_new, missing_in_old in files_with_changes:
                 st.markdown(f"### 📂 Pair {file_num} of {len(matched)}")
                 st.markdown(
                     f'<div class="pair-card" style="margin-bottom:1rem">'
@@ -1043,6 +1068,26 @@ if left and right:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+                # ── Missing sheet notices ─────────────────────
+                if missing_in_new:
+                    sheets_list = ", ".join(f"<b>{s}</b>" for s in missing_in_new)
+                    st.markdown(
+                        f'<div class="warn-box">📋 Sheet(s) only in OLD file (skipped): {sheets_list}</div>',
+                        unsafe_allow_html=True,
+                    )
+                if missing_in_old:
+                    sheets_list = ", ".join(f"<b>{s}</b>" for s in missing_in_old)
+                    st.markdown(
+                        f'<div class="info-box">📋 Sheet(s) only in NEW file (skipped): {sheets_list}</div>',
+                        unsafe_allow_html=True,
+                    )
+                if not changed_sheets and not missing_in_new and not missing_in_old:
+                    st.markdown(
+                        '<div class="success-box" style="text-align:left;margin-bottom:1rem">'
+                        '✅ All common sheets are identical.</div>',
+                        unsafe_allow_html=True,
+                    )
 
                 for sh, co, cn, add, rem, use_key, key_desc, is_trunc, old_rows, new_rows in changed_sheets:
                     parts = []
