@@ -815,7 +815,8 @@ if left and right:
         n = n.rsplit(".", 1)[0]
         return n.rsplit("_", 1)[0].lower() if ignore and "_" in n else n.lower()
 
-    matched, usedR = [], set()
+    # ── Auto-match by filename similarity ────
+    auto_matched, usedR = [], set()
     for lf in left:
         lcmp = comparable(lf.name, ignore_suffix)
         best, ratio = None, 0.0
@@ -826,36 +827,114 @@ if left and right:
             if r >= threshold and r > ratio:
                 best, ratio = rf, r
         if best:
-            matched.append((lf, best))
+            auto_matched.append((lf, best))
             usedR.add(best.name)
 
-    # Matched pairs summary
-    st.markdown(f'<div class="step-label" style="margin-top:1.5rem">Step 3 — Review & Run</div>',
+    st.markdown('<div class="step-label" style="margin-top:1.5rem">Step 3 — Review & Run</div>',
                 unsafe_allow_html=True)
 
+    # ── Manual pairing UI (always shown when uploads exist) ──────────
+    left_names  = {f.name: f for f in left}
+    right_names = {f.name: f for f in right}
+
+    if not auto_matched:
+        st.markdown(
+            '<div class="warn-box">⚠️ No files matched automatically — the filenames are too '
+            'different. Use <b>Manual Pairing</b> below to pair them directly.</div>',
+            unsafe_allow_html=True,
+        )
+
+    with st.expander(
+        f"🔧 Manual Pairing {'(recommended — auto-match found 0 pairs)' if not auto_matched else '(optional override)'}",
+        expanded=not auto_matched,
+    ):
+        st.markdown(
+            '<div style="color:#7888a8;font-size:0.82rem;margin-bottom:0.75rem">'
+            'Select an OLD file and a NEW file to compare, then click Add Pair. '
+            'Manual pairs override auto-matching for those files.</div>',
+            unsafe_allow_html=True,
+        )
+        mp_col1, mp_col2, mp_col3 = st.columns([2, 2, 1])
+        with mp_col1:
+            sel_old = st.selectbox("OLD file", list(left_names.keys()), key="manual_old")
+        with mp_col2:
+            sel_new = st.selectbox("NEW file", list(right_names.keys()), key="manual_new")
+        with mp_col3:
+            st.markdown("<div style='height:1.95rem'></div>", unsafe_allow_html=True)
+            add_pair = st.button("＋ Add Pair")
+
+        if "manual_pairs" not in st.session_state:
+            st.session_state.manual_pairs = []
+
+        if add_pair:
+            entry = (sel_old, sel_new)
+            if entry not in st.session_state.manual_pairs:
+                st.session_state.manual_pairs.append(entry)
+
+        if st.session_state.manual_pairs:
+            st.markdown("**Added manual pairs:**")
+            to_remove = []
+            for idx, (on, nn) in enumerate(st.session_state.manual_pairs):
+                r1, r2 = st.columns([8, 1])
+                with r1:
+                    st.markdown(
+                        f'<div class="pair-card" style="margin-bottom:0.3rem">'
+                        f'<span class="fname">{on}</span>'
+                        f'<span class="arrow">⟶</span>'
+                        f'<span class="fname">{nn}</span>'
+                        f'<span style="color:#6382ff;font-family:monospace;font-size:0.72rem">manual</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+                with r2:
+                    if st.button("✕", key=f"rm_{idx}"):
+                        to_remove.append(idx)
+            for idx in reversed(to_remove):
+                st.session_state.manual_pairs.pop(idx)
+
+        if st.button("🗑 Clear all manual pairs", key="clear_manual"):
+            st.session_state.manual_pairs = []
+
+    # ── Merge auto + manual pairs (manual takes priority) ────────────
+    manual_old_names = {on for on, _ in st.session_state.get("manual_pairs", [])}
+    merged_matched = [
+        (lf, rf) for lf, rf in auto_matched
+        if lf.name not in manual_old_names
+    ]
+    for old_name, new_name in st.session_state.get("manual_pairs", []):
+        if old_name in left_names and new_name in right_names:
+            merged_matched.append((left_names[old_name], right_names[new_name]))
+
+    matched = merged_matched  # final list used for comparison
+
+    # ── Pair summary ─────────────────────────────────────────────────
     if matched:
-        with st.expander(f"📋 {len(matched)} matched pair(s)", expanded=False):
+        with st.expander(f"📋 {len(matched)} pair(s) ready to compare", expanded=False):
             for lf, rf in matched:
+                is_manual = lf.name in manual_old_names
+                tag = '<span style="color:#6382ff;font-family:monospace;font-size:0.72rem">manual</span>' if is_manual else ''
                 st.markdown(
                     f'<div class="pair-card">'
                     f'<span class="fname">{lf.name}</span>'
                     f'<span class="arrow">⟶</span>'
                     f'<span class="fname">{rf.name}</span>'
-                    f'</div>',
+                    f'{tag}</div>',
                     unsafe_allow_html=True,
                 )
         unmatched_l = [f.name for f in left  if f.name not in {lf.name for lf, _ in matched}]
         unmatched_r = [f.name for f in right if f.name not in {rf.name for _, rf in matched}]
         if unmatched_l or unmatched_r:
             st.markdown(
-                f'<div class="warn-box">⚠️ Unmatched — OLD: {", ".join(unmatched_l) or "none"} '
+                f'<div class="warn-box">⚠️ Still unmatched — OLD: {", ".join(unmatched_l) or "none"} '
                 f'· NEW: {", ".join(unmatched_r) or "none"}</div>',
                 unsafe_allow_html=True,
             )
-    else:
-        st.warning("No file pairs matched. Try lowering the match threshold.")
 
-    run_clicked = st.button("▶  Run Comparison", use_container_width=False)
+    run_clicked = st.button(
+        "▶  Run Comparison",
+        disabled=not matched,
+        use_container_width=False,
+    )
 
     if run_clicked and matched:
         prog = st.progress(0, text="Starting…")
@@ -934,10 +1013,17 @@ if left and right:
 
         # ── Results ──────────────────────────────
         if not files_with_changes:
-            st.markdown(
-                f'<div class="success-box">✅ All {len(matched)} file pair(s) are identical.</div>',
-                unsafe_allow_html=True,
-            )
+            if len(matched) == 0:
+                st.markdown(
+                    '<div class="warn-box">⚠️ No pairs were compared — '
+                    'use Manual Pairing above to pair files with different names.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div class="success-box">✅ All {len(matched)} file pair(s) are identical.</div>',
+                    unsafe_allow_html=True,
+                )
         else:
             st.markdown(
                 f'<div class="metric-row">'
