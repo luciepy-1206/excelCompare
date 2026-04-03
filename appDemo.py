@@ -428,7 +428,9 @@ def _read_sheets_cached(
 
     try:
         wb = load_workbook(file_bytes, data_only=True)
-        visible_sheets = [ws.title for ws in wb.worksheets if ws.sheet_state == "visible"]
+        # Include all sheets: visible, hidden, and very-hidden
+        # Users may need to compare hidden sheets (e.g. Lookups in OLD file)
+        visible_sheets = [ws.title for ws in wb.worksheets]
 
         # Read ALL sheets in one pass (no per-sheet re-seek)
         file_bytes.seek(0)
@@ -1065,49 +1067,58 @@ if left and right:
                 missing_in_new: List[str] = []
                 missing_in_old: List[str] = []
 
-                # Get sheet names present in the NEW file
+                # Get ALL sheet names present in the NEW file (including hidden)
                 decR.seek(0)
                 wb_new = load_workbook(decR, read_only=True, data_only=True)
-                new_sheet_names = set(wb_new.sheetnames)
+                new_sheet_names = [ws.title for ws in wb_new.worksheets]
+                new_sheet_names_set = set(new_sheet_names)
 
-                # Sheets in OLD but not in NEW
+                def _read_sheet_new(sh: str, hr: int) -> pd.DataFrame:
+                    """Read one sheet from the NEW file using a consistent dedup scheme."""
+                    decR.seek(0)
+                    df_raw = pd.read_excel(decR, sheet_name=sh, header=None, engine="openpyxl")
+                    if hr < len(df_raw):
+                        raw_cols = df_raw.iloc[hr].tolist()
+                        df_out = df_raw.iloc[hr + 1:].reset_index(drop=True).copy()
+                        seen_nc: Dict[str, int] = {}
+                        deduped: List[str] = []
+                        for i, c in enumerate(raw_cols):
+                            name = str(c).strip() if pd.notna(c) else f"Unnamed_{i}"
+                            if not name or name == "nan":
+                                name = f"Unnamed_{i}"
+                            if name in seen_nc:
+                                seen_nc[name] += 1
+                                deduped.append(f"{name}_{seen_nc[name]}")
+                            else:
+                                seen_nc[name] = 0
+                                deduped.append(name)
+                        df_out.columns = deduped
+                    else:
+                        df_out = df_raw.copy()
+                        df_out.columns = [str(c).strip() for c in df_out.columns]
+                    return df_out.astype(str)
+
+                # All sheets present in OLD — read matching ones from NEW
                 for sh in shL:
-                    if sh not in new_sheet_names:
+                    if sh not in new_sheet_names_set:
                         missing_in_new.append(sh)
                         continue
-                    # Use override if set, else use auto-detected row from OLD
-                    hr_old = header_overrides.get(sh, header_rows_old.get(sh, 0))
+                    # header override applies to BOTH files (same row number)
+                    hr = header_overrides.get(sh, header_rows_old.get(sh, 0))
                     try:
-                        decR.seek(0)
-                        df_new_raw = pd.read_excel(decR, sheet_name=sh, header=None, engine="openpyxl")
-                        if hr_old < len(df_new_raw):
-                            new_cols_raw = df_new_raw.iloc[hr_old].tolist()
-                            df_new = df_new_raw.iloc[hr_old + 1:].reset_index(drop=True).copy()
-                            # Deduplicate column names with _N suffix (same scheme as OLD)
-                            seen_nc: Dict[str, int] = {}
-                            deduped_cols = []
-                            for c in new_cols_raw:
-                                name = str(c).strip() if pd.notna(c) else ""
-                                if name in seen_nc:
-                                    seen_nc[name] += 1
-                                    deduped_cols.append(f"{name}_{seen_nc[name]}")
-                                else:
-                                    seen_nc[name] = 0
-                                    deduped_cols.append(name)
-                            df_new.columns = deduped_cols
-                        else:
-                            df_new = pd.read_excel(decR, sheet_name=sh, header=0, engine="openpyxl")
+                        df_new = _read_sheet_new(sh, hr)
+                        # Align NEW column names to OLD column names
                         try:
                             df_new.columns = align_new_columns_to_reference(
                                 list(df_new.columns), list(shL[sh].columns)
                             )
                         except Exception:
-                            df_new.columns = [str(c) for c in df_new.columns]
-                        shR[sh] = df_new.astype(str)
-                    except Exception as sheet_err:
+                            pass
+                        shR[sh] = df_new
+                    except Exception:
                         missing_in_new.append(sh)
 
-                # Sheets in NEW but not in OLD
+                # Sheets only in NEW (not in OLD) — flag as missing in old
                 for sh in new_sheet_names:
                     if sh not in shL:
                         missing_in_old.append(sh)
