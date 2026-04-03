@@ -468,15 +468,28 @@ def _read_sheets_cached(
                 header_row = detect_header_row_heuristic(df_raw)
 
             # Slice header + data in-memory (no second read_excel)
+            # Strip whitespace from col names (merged cells leave trailing spaces)
+            # and use consistent _N dedup to match NEW file reader
             if header_row < len(df_raw):
-                new_cols = df_raw.iloc[header_row].tolist()
+                raw_cols = df_raw.iloc[header_row].tolist()
                 df_data  = df_raw.iloc[header_row + 1:].copy()
-                df_data.columns = [str(c) if pd.notna(c) else f"Unnamed_{i}"
-                                   for i, c in enumerate(new_cols)]
+                seen_c: Dict[str, int] = {}
+                clean_cols = []
+                for i, c in enumerate(raw_cols):
+                    name = str(c).strip() if pd.notna(c) else f"Unnamed_{i}"
+                    if not name or name == "nan":
+                        name = f"Unnamed_{i}"
+                    if name in seen_c:
+                        seen_c[name] += 1
+                        clean_cols.append(f"{name}_{seen_c[name]}")
+                    else:
+                        seen_c[name] = 0
+                        clean_cols.append(name)
+                df_data.columns = clean_cols
                 df_data = df_data.reset_index(drop=True)
             else:
                 df_data = df_raw.copy()
-                df_data.columns = [str(c) for c in df_data.columns]
+                df_data.columns = [str(c).strip() for c in df_data.columns]
 
             # Flatten MultiIndex columns if present
             if isinstance(df_data.columns, pd.MultiIndex):
@@ -515,7 +528,7 @@ def read_visible_sheets_with_header_detection(
 
 def _normalize_for_match(s: str) -> str:
     s = str(s).strip().lower()
-    s = re.sub(r'(_\d+)+$', '', s)      # FIX: was r'(_\\d+)+$' (double-escaped)
+    s = re.sub(r'([_.]\d+)+$', '', s)  # strip both _1 and .1 dedup suffixes
     return re.sub(r'[^a-z0-9]', '', s)
 
 
@@ -669,12 +682,43 @@ def compare_key_based(df1, df2, keys):
 
 
 def compare_keyless(df1, df2):
+    if df1.empty and df2.empty:
+        return pd.DataFrame(columns=df1.columns), pd.DataFrame(columns=df1.columns)
+
     n1 = normalize_df(df1)
     n2 = normalize_df(df2)
-    h1 = pd.util.hash_pandas_object(n1, index=False)
-    h2 = pd.util.hash_pandas_object(n2, index=False)
-    added   = df2.loc[~h2.isin(h1)].reset_index(drop=True)
-    removed = df1.loc[~h1.isin(h2)].reset_index(drop=True)
+
+    # Guard: if no common columns exist, hashing produces meaningless results
+    common = list(n1.columns.intersection(n2.columns))
+    if not common:
+        return pd.DataFrame(columns=df2.columns), pd.DataFrame(columns=df1.columns)
+
+    n1c = n1[common]
+    n2c = n2[common]
+
+    # Multiset-aware comparison using value_counts instead of set isin()
+    # This correctly handles duplicate rows: [A,A,B] vs [A,B,B] → 1 change
+    def _row_str(df_norm: pd.DataFrame) -> pd.Series:
+        return df_norm.apply(lambda r: "||".join(r.astype(str)), axis=1)
+
+    s1 = _row_str(n1c)
+    s2 = _row_str(n2c)
+
+    counts1 = s1.value_counts()
+    counts2 = s2.value_counts()
+
+    all_keys = set(counts1.index) | set(counts2.index)
+    removed_keys, added_keys = set(), set()
+    for k in all_keys:
+        c1 = counts1.get(k, 0)
+        c2 = counts2.get(k, 0)
+        if c1 > c2:
+            removed_keys.add(k)
+        elif c2 > c1:
+            added_keys.add(k)
+
+    added   = df2.loc[s2.isin(added_keys)].reset_index(drop=True)
+    removed = df1.loc[s1.isin(removed_keys)].reset_index(drop=True)
     return added, removed
 
 
@@ -1037,9 +1081,20 @@ if left and right:
                         decR.seek(0)
                         df_new_raw = pd.read_excel(decR, sheet_name=sh, header=None, engine="openpyxl")
                         if hr_old < len(df_new_raw):
-                            new_cols = df_new_raw.iloc[hr_old].tolist()
-                            df_new   = df_new_raw.iloc[hr_old + 1:].reset_index(drop=True).copy()
-                            df_new.columns = new_cols
+                            new_cols_raw = df_new_raw.iloc[hr_old].tolist()
+                            df_new = df_new_raw.iloc[hr_old + 1:].reset_index(drop=True).copy()
+                            # Deduplicate column names with _N suffix (same scheme as OLD)
+                            seen_nc: Dict[str, int] = {}
+                            deduped_cols = []
+                            for c in new_cols_raw:
+                                name = str(c).strip() if pd.notna(c) else ""
+                                if name in seen_nc:
+                                    seen_nc[name] += 1
+                                    deduped_cols.append(f"{name}_{seen_nc[name]}")
+                                else:
+                                    seen_nc[name] = 0
+                                    deduped_cols.append(name)
+                            df_new.columns = deduped_cols
                         else:
                             df_new = pd.read_excel(decR, sheet_name=sh, header=0, engine="openpyxl")
                         try:
