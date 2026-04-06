@@ -291,6 +291,57 @@ def decrypt_file(uploaded_file, password: str = DEFAULT_PASSWORD) -> BytesIO:
 
 
 # ─────────────────────────────────────────────
+# EAGER AUTO-DETECTION (cached, runs on upload)
+# ─────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def detect_header_rows_for_file(file_bytes_raw: bytes) -> Dict[str, int]:
+    """
+    Run smart header detection on every sheet in a file immediately after upload.
+    Returns {sheet_name: detected_row (1-indexed, for display)}.
+    Cached by file content so it only runs once per unique file.
+    """
+    result: Dict[str, int] = {}
+    try:
+        wb = load_workbook(BytesIO(file_bytes_raw), data_only=True)
+        all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
+                                header=None, engine="openpyxl")
+        for ws in wb.worksheets:
+            sh = ws.title
+            df_raw = all_raw.get(sh)
+            if df_raw is None or df_raw.empty:
+                result[sh] = 1
+                continue
+            detected = detect_header_row_heuristic(df_raw, ws=ws)
+            result[sh] = detected + 1   # convert to 1-indexed for display
+    except Exception:
+        pass
+    return result
+
+
+def get_auto_detected_rows(uploaded_files: list) -> Dict[str, int]:
+    """
+    Merge auto-detected header rows across all uploaded files.
+    If two files disagree on the same sheet, take the higher row number
+    (more conservative — skips more potential title rows).
+    """
+    merged: Dict[str, int] = {}
+    for uf in (uploaded_files or []):
+        try:
+            rows = detect_header_rows_for_file(uf.getvalue())
+            uf.seek(0)
+            for sh, row in rows.items():
+                # Take the max (most conservative) if files disagree
+                merged[sh] = max(merged.get(sh, 1), row)
+        except Exception:
+            try:
+                uf.seek(0)
+            except Exception:
+                pass
+    return merged
+
+
+# ─────────────────────────────────────────────
 # NORMALIZATION UTILITIES
 # ─────────────────────────────────────────────
 
@@ -967,53 +1018,95 @@ with cfg_col3:
 
 # ── Header Row Overrides (shown only when files uploaded)
 if left or right:
-    with st.expander("🔢 Header Row Overrides (fix merged-cell / wrong header issues)", expanded=False):
+    all_files = (left or []) + (right or [])
+
+    # Run auto-detection eagerly — cached so it's instant on reruns
+    auto_rows = get_auto_detected_rows(all_files)
+
+    # Collect ordered sheet names across all files
+    all_sheet_names: list[str] = []
+    for sh in auto_rows:
+        if sh not in all_sheet_names:
+            all_sheet_names.append(sh)
+
+    # Initialise session state on first load, or when files change
+    files_key = tuple(sorted(f.name for f in all_files))
+    if (st.session_state.get("_hdr_files_key") != files_key
+            or "header_overrides" not in st.session_state):
+        # Reset overrides when the uploaded file set changes
+        st.session_state.header_overrides = {}
+        st.session_state._hdr_files_key = files_key
+
+    with st.expander("🔢 Header Row Overrides", expanded=False):
         st.markdown(
             '<div style="color:#7888a8;font-size:0.82rem;margin-bottom:0.75rem">'
-            'If a sheet has merged cells or a multi-row title above the real header, '
-            'set the exact row number here. <b>Row 1 = first row of the sheet</b> (default). '
-            'Leave blank to use auto-detection.</div>',
+            'Auto-detection is shown below. Change a value only if the detected row '
+            'is wrong — for example when a sheet has a merged group-label row above '
+            'the real header. <b>Row 1 = first row of the sheet.</b></div>',
             unsafe_allow_html=True,
         )
-        # Collect all unique sheet names from uploaded files
-        all_sheet_names: list[str] = []
-        for uf in (left or []) + (right or []):
-            try:
-                from openpyxl import load_workbook as _lw
-                wb_tmp = _lw(BytesIO(uf.read()), read_only=True)
-                uf.seek(0)
-                for sh in wb_tmp.sheetnames:
-                    if sh not in all_sheet_names:
-                        all_sheet_names.append(sh)
-            except Exception:
-                uf.seek(0)
 
         if not all_sheet_names:
             st.caption("Upload files above to see sheet names.")
         else:
-            if "header_overrides" not in st.session_state:
-                st.session_state.header_overrides = {}
-
-            # Show one number_input per sheet in a compact grid
             cols_per_row = 3
             sheet_chunks = [all_sheet_names[i:i+cols_per_row]
                             for i in range(0, len(all_sheet_names), cols_per_row)]
+
             for chunk in sheet_chunks:
                 grid = st.columns(cols_per_row)
                 for col, sh in zip(grid, chunk):
                     with col:
-                        current = st.session_state.header_overrides.get(sh, None)
+                        auto_val  = auto_rows.get(sh, 1)
+                        # If user has previously overridden this sheet, use their value;
+                        # otherwise default to the auto-detected row
+                        current   = st.session_state.header_overrides.get(sh, auto_val)
+                        is_overridden = (current != auto_val)
+
+                        label = (
+                            f'"{sh}" ✏️'      # pencil = user-overridden
+                            if is_overridden
+                            else f'"{sh}" 🤖'  # robot = using auto-detect
+                        )
                         val = st.number_input(
-                            f'"{sh}"',
+                            label,
                             min_value=1, max_value=100,
-                            value=int(current) if current is not None else 1,
+                            value=int(current),
                             step=1,
                             key=f"hdr_{sh}",
-                            help=f"Header row for sheet '{sh}' (1 = first row)",
+                            help=(
+                                f"Auto-detected: row {auto_val}. "
+                                + ("Currently overridden." if is_overridden
+                                   else "Matches auto-detection — change only if wrong.")
+                            ),
                         )
-                        st.session_state.header_overrides[sh] = val
+                        # Only store in overrides when the user deviates from auto-detect
+                        if val != auto_val:
+                            st.session_state.header_overrides[sh] = val
+                        elif sh in st.session_state.header_overrides:
+                            # User reset back to auto-detected value → remove override
+                            del st.session_state.header_overrides[sh]
 
-            if st.button("↺ Reset all to auto-detect", key="reset_overrides"):
+            # Summary line
+            n_overridden = len(st.session_state.header_overrides)
+            if n_overridden:
+                overridden_names = ", ".join(
+                    f"{sh} → row {row}"
+                    for sh, row in st.session_state.header_overrides.items()
+                )
+                st.markdown(
+                    f'<div style="color:#fbbf24;font-size:0.78rem;margin-top:0.5rem">'
+                    f'✏️ {n_overridden} sheet(s) overridden: {overridden_names}</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div style="color:#4a5878;font-size:0.78rem;margin-top:0.5rem">'
+                    '🤖 All sheets using auto-detection</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if n_overridden and st.button("↺ Reset all to auto-detect", key="reset_overrides"):
                 st.session_state.header_overrides = {}
                 st.rerun()
 
@@ -1165,68 +1258,26 @@ if left and right:
                     decL, key_columns=keys, header_overrides=header_overrides
                 )
 
-                # Align NEW sheets to OLD header rows & column names
-                shR: Dict[str, pd.DataFrame] = {}
-                missing_in_new: List[str] = []
-                missing_in_old: List[str] = []
+                # Read NEW file through the SAME cached pipeline as OLD
+                # so it gets its own independent auto-detection with style signals.
+                # Override priority: user override > NEW's own detection > OLD's detection
+                shR, header_rows_new = read_visible_sheets_with_header_detection(
+                    decR, key_columns=keys, header_overrides=header_overrides
+                )
 
-                # Get ALL sheet names present in the NEW file (including hidden)
-                decR.seek(0)
-                wb_new = load_workbook(decR, read_only=True, data_only=True)
-                new_sheet_names = [ws.title for ws in wb_new.worksheets]
-                new_sheet_names_set = set(new_sheet_names)
-
-                def _read_sheet_new(sh: str, hr: int) -> pd.DataFrame:
-                    """Read one sheet from the NEW file with consistent dedup + smart detection."""
-                    decR.seek(0)
-                    df_raw = pd.read_excel(decR, sheet_name=sh, header=None, engine="openpyxl")
-                    ws_new = wb_new[sh] if sh in wb_new.sheetnames else None
-                    if hr < len(df_raw):
-                        raw_cols = df_raw.iloc[hr].tolist()
-                        df_out = df_raw.iloc[hr + 1:].reset_index(drop=True).copy()
-                        seen_nc: Dict[str, int] = {}
-                        deduped: List[str] = []
-                        for idx, c in enumerate(raw_cols):
-                            name = str(c).strip() if pd.notna(c) else f"Unnamed_{idx}"
-                            if not name or name == "nan":
-                                name = f"Unnamed_{idx}"
-                            if name in seen_nc:
-                                seen_nc[name] += 1
-                                deduped.append(f"{name}_{seen_nc[name]}")
-                            else:
-                                seen_nc[name] = 0
-                                deduped.append(name)
-                        df_out.columns = deduped
-                    else:
-                        df_out = df_raw.copy()
-                        df_out.columns = [str(c).strip() for c in df_out.columns]
-                    return df_out.astype(str)
-
-                # All sheets present in OLD — read matching ones from NEW
-                for sh in shL:
-                    if sh not in new_sheet_names_set:
-                        missing_in_new.append(sh)
-                        continue
-                    # header override applies to BOTH files (same row number)
-                    # When no override: use OLD's detected row (already smart-detected)
-                    hr = header_overrides.get(sh, header_rows_old.get(sh, 0))
-                    try:
-                        df_new = _read_sheet_new(sh, hr)
-                        # Align NEW column names to OLD column names
+                # Align NEW column names to OLD column names for every shared sheet
+                for sh in list(shR.keys()):
+                    if sh in shL:
                         try:
-                            df_new.columns = align_new_columns_to_reference(
-                                list(df_new.columns), list(shL[sh].columns)
+                            shR[sh].columns = align_new_columns_to_reference(
+                                list(shR[sh].columns), list(shL[sh].columns)
                             )
                         except Exception:
                             pass
-                        shR[sh] = df_new
-                    except Exception:
-                        missing_in_new.append(sh)
 
-                # Sheets only in NEW (not in OLD) — flag as missing in old
-                for sh in new_sheet_names:
-                    if sh not in shL:
-                        missing_in_old.append(sh)
+                # Determine which sheets are missing in each file
+                missing_in_new: List[str] = [sh for sh in shL if sh not in shR]
+                missing_in_old: List[str] = [sh for sh in shR if sh not in shL]
 
             except Exception as e:
                 import traceback
