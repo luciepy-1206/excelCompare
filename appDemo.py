@@ -362,11 +362,11 @@ def find_header_row_by_column_names(df_raw: pd.DataFrame, reference_columns: Lis
     return best_row if best_match_count >= 2 else detect_header_row_heuristic(df_raw)
 
 
-def find_header_row_with_keys(df_raw: pd.DataFrame, key_columns: List[str]) -> int:
+def find_header_row_with_keys(df_raw: pd.DataFrame, key_columns: List[str], ws=None) -> int:
     if not key_columns:
-        return detect_header_row_heuristic(df_raw)
+        return detect_header_row_heuristic(df_raw, ws=ws)
     normalized_keys = {normalize_colname(k) for k in key_columns if k.strip()}
-    for i in range(min(15, len(df_raw))):            # ← range-based, not iterrows
+    for i in range(min(15, len(df_raw))):
         row = df_raw.iloc[i]
         row_values = {
             normalize_colname(str(val))
@@ -375,35 +375,138 @@ def find_header_row_with_keys(df_raw: pd.DataFrame, key_columns: List[str]) -> i
         }
         if normalized_keys & row_values:
             return i
-    return detect_header_row_heuristic(df_raw)
+    return detect_header_row_heuristic(df_raw, ws=ws)
 
 
-def detect_header_row_heuristic(df_raw: pd.DataFrame) -> int:
+def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
     """
-    Find the most likely header row in the first 15 rows.
-    Uses: non-empty count, text ratio, and column contiguity.
-    Fixed: uses iloc[i] (positional) so index resets don't cause off-by-one errors.
-    """
-    head = df_raw.head(15)
-    nonempty_counts = head.apply(lambda r: r.notna().sum(), axis=1)
-    max_nonempty = nonempty_counts.max() or 1
+    Multi-signal header row detection searching the first 15 rows.
+    Scores every candidate row; the highest scorer wins.
 
-    for i in range(len(head)):
-        row = head.iloc[i]                           # ← iloc, not label-index
-        filled = nonempty_counts.iloc[i]
-        if filled < 2:
+    Signals (with weights):
+      bold_ratio         x3.0  — bold cells are almost always headers
+      fill_ratio         x1.5  — header rows tend to be densely filled
+      all_string         x1.0  — header cells are strings, data mixes types
+      unique_ratio       x1.0  — header values are unique within the row
+      name_like          x1.0  — values look like column names (start with letter, <40 chars)
+      post_consistency   x1.0  — rows after the header should be uniform
+      low_numeric        x0.5  — headers rarely contain only numbers
+      row_penalty        x0.1  — prefer earlier rows when scores are equal
+
+    Penalties:
+      horizontal_merge   -2.5  — rows whose cells span multiple columns are
+                                  group-label rows sitting above the real header
+      vertical_cont      skip  — rows inside a vertical merge are never headers
+
+    Skips: empty rows, single long-description rows (>50 chars, 1 cell),
+           vertical-merge continuation rows.
+
+    ws: optional openpyxl Worksheet — enables bold and merge signals.
+        When None, only pandas-based signals are used.
+    """
+    if df_raw.empty:
+        return 0
+
+    head     = df_raw.head(15)
+    n_cols   = df_raw.shape[1] or 1
+    search_n = len(head)
+
+    # ── Pre-compute merge info from openpyxl ─────────────────────────
+    # horizontal_merge_rows: rows that START wide horizontal merges (group labels)
+    # vertical_cont_rows:    rows that are continuations of a vertical merge
+    horizontal_merge_rows: set[int] = set()
+    vertical_cont_rows:    set[int] = set()
+    xl_rows: list = []
+
+    if ws is not None:
+        xl_rows = list(ws.iter_rows(max_row=search_n))
+        for mr in ws.merged_cells.ranges:
+            ri        = mr.min_row - 1          # 0-indexed
+            col_span  = mr.max_col - mr.min_col
+            row_span  = mr.max_row - mr.min_row
+            # Horizontal multi-column merge on a single row = group label
+            if col_span >= 1 and row_span == 0 and ri < search_n:
+                horizontal_merge_rows.add(ri)
+            # Vertical merge — mark continuation rows (not the top-left cell row)
+            if row_span >= 1:
+                for r in range(mr.min_row + 1, mr.max_row + 1):
+                    if r - 1 < search_n:
+                        vertical_cont_rows.add(r - 1)
+
+    best_score, best_row = -1.0, 0
+
+    for i in range(search_n):
+        # Skip rows that are inside a vertical merge (never a header)
+        if i in vertical_cont_rows:
             continue
-        non_null_vals = [v for v in row if pd.notna(v) and str(v).strip()]
-        if len(non_null_vals) < 2:
+
+        pd_row = head.iloc[i]
+        vals   = [v for v in pd_row if pd.notna(v) and str(v).strip()]
+        n_vals = len(vals)
+
+        if n_vals < 2:
             continue
-        filled_ratio  = filled / max_nonempty
-        text_ratio    = sum(not str(x).replace('.','',1).isdigit() for x in non_null_vals) / len(non_null_vals)
-        valid_indices = [j for j, v in enumerate(row) if pd.notna(v) and str(v).strip()]
-        span          = max(valid_indices) - min(valid_indices) + 1 if valid_indices else 1
-        contiguous    = len(valid_indices) / span
-        if filled_ratio >= 0.4 and text_ratio >= 0.5 and contiguous > 0.5:
-            return i
-    return 0
+        # Skip single long description rows (instructions, not headers)
+        if n_vals == 1 and len(str(vals[0])) > 50:
+            continue
+
+        # ── Bold signal (requires openpyxl ws) ──────────────────────
+        if xl_rows and i < len(xl_rows):
+            bold_count = sum(
+                1 for c in xl_rows[i]
+                if c.value is not None and str(c.value).strip()
+                and c.font and c.font.bold
+            )
+            bold_r = bold_count / n_vals
+        else:
+            bold_r = 0.0
+
+        # ── Content signals ───────────────────────────────────────────
+        all_str   = float(all(isinstance(v, str) for v in vals))
+        unique_r  = len({str(v) for v in vals}) / n_vals
+        fill_r    = n_vals / n_cols
+        num_r     = sum(
+            1 for v in vals
+            if str(v).replace(".", "", 1).replace("-", "", 1).isdigit()
+        ) / n_vals
+        name_like = sum(
+            1 for v in vals
+            if isinstance(v, str) and len(v) < 40
+            and re.match(r"^[A-Za-z]", v.strip())
+        ) / n_vals
+
+        # ── Post-row consistency (look-ahead up to 8 rows) ───────────
+        lookahead = df_raw.iloc[i + 1 : i + 9]
+        if len(lookahead) >= 2:
+            fill_counts  = lookahead.apply(lambda r: r.notna().sum(), axis=1)
+            post_consist = 1.0 / (1.0 + fill_counts.std())
+        else:
+            post_consist = 0.0
+
+        # ── Composite score ───────────────────────────────────────────
+        score = (
+            bold_r        * 3.0
+            + fill_r      * 1.5
+            + all_str     * 1.0
+            + unique_r    * 1.0
+            + name_like   * 1.0
+            + post_consist * 1.0
+            + (1 - num_r) * 0.5
+            - i           * 0.1     # slight penalty for later rows
+        )
+
+        # ── Merged group-label penalty ────────────────────────────────
+        # Rows that start wide horizontal merges are group labels sitting
+        # above the real header (e.g. "Subtotal | Sort Type | Font…").
+        # Penalise heavily so the dense row beneath scores higher.
+        if i in horizontal_merge_rows:
+            score -= 2.5
+
+        if score > best_score:
+            best_score = score
+            best_row   = i
+
+    return best_row
 
 
 # ─────────────────────────────────────────────
@@ -465,9 +568,9 @@ def _read_sheets_cached(
             if sh in header_overrides:
                 header_row = header_overrides[sh]
             elif key_columns:
-                header_row = find_header_row_with_keys(df_raw, key_columns)
+                header_row = find_header_row_with_keys(df_raw, key_columns, ws=ws)
             else:
-                header_row = detect_header_row_heuristic(df_raw)
+                header_row = detect_header_row_heuristic(df_raw, ws=ws)
 
             # Slice header + data in-memory (no second read_excel)
             # Strip whitespace from col names (merged cells leave trailing spaces)
@@ -1074,18 +1177,19 @@ if left and right:
                 new_sheet_names_set = set(new_sheet_names)
 
                 def _read_sheet_new(sh: str, hr: int) -> pd.DataFrame:
-                    """Read one sheet from the NEW file using a consistent dedup scheme."""
+                    """Read one sheet from the NEW file with consistent dedup + smart detection."""
                     decR.seek(0)
                     df_raw = pd.read_excel(decR, sheet_name=sh, header=None, engine="openpyxl")
+                    ws_new = wb_new[sh] if sh in wb_new.sheetnames else None
                     if hr < len(df_raw):
                         raw_cols = df_raw.iloc[hr].tolist()
                         df_out = df_raw.iloc[hr + 1:].reset_index(drop=True).copy()
                         seen_nc: Dict[str, int] = {}
                         deduped: List[str] = []
-                        for i, c in enumerate(raw_cols):
-                            name = str(c).strip() if pd.notna(c) else f"Unnamed_{i}"
+                        for idx, c in enumerate(raw_cols):
+                            name = str(c).strip() if pd.notna(c) else f"Unnamed_{idx}"
                             if not name or name == "nan":
-                                name = f"Unnamed_{i}"
+                                name = f"Unnamed_{idx}"
                             if name in seen_nc:
                                 seen_nc[name] += 1
                                 deduped.append(f"{name}_{seen_nc[name]}")
@@ -1104,6 +1208,7 @@ if left and right:
                         missing_in_new.append(sh)
                         continue
                     # header override applies to BOTH files (same row number)
+                    # When no override: use OLD's detected row (already smart-detected)
                     hr = header_overrides.get(sh, header_rows_old.get(sh, 0))
                     try:
                         df_new = _read_sheet_new(sh, hr)
