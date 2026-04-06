@@ -1,6 +1,20 @@
-streamlit
-pandas
-openpyxl
-streamlit-sortables
-msoffcrypto-tool
-PyMuPDF
+# Combined requirements for both apps in one Streamlit deployment
+# Python >= 3.10 required
+# Streamlit Cloud: deploy alongside packages.txt
+ 
+# ── Core ──────────────────────────────────────────────────────────────
+streamlit>=1.28.0
+pandas>=1.5.0
+ 
+# ── Excel Diff (app.py) ───────────────────────────────────────────────
+openpyxl>=3.0.10
+msoffcrypto-tool>=5.0.0
+ 
+# ── PDF Comparison (pdf_app.py) ───────────────────────────────────────
+streamlit-pdf-viewer>=0.0.18
+pypdf>=4.0.0
+pdfplumber>=0.10.0
+PyMuPDF>=1.23.0
+pytesseract>=0.3.10
+pdf2image>=1.16.0
+Pillow>=9.0.0
