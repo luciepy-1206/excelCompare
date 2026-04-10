@@ -357,7 +357,11 @@ def _normalize_cell(v: str) -> str:
     """Normalize a single string cell value."""
     if v == "" or v == "nan":
         return ""
-    s = v.strip().upper()
+    # Collapse all whitespace variants (newlines, tabs, non-breaking spaces,
+    # multiple spaces) into a single space, then strip ends.
+    # This prevents 'Current\nComp-Ratio' and 'Current Comp-Ratio' from
+    # hashing differently when they look identical in a cell.
+    s = re.sub(r'[\s\u00a0]+', ' ', v).strip().upper()
     if s in _BOOL_TRUE:
         return "TRUE"
     if s in _BOOL_FALSE:
@@ -993,13 +997,40 @@ def export_to_excel(changed_old: pd.DataFrame, changed_new: pd.DataFrame, keys: 
 
 # ── Step 1: Upload
 st.markdown('<div class="step-label">Step 1 — Upload Files</div>', unsafe_allow_html=True)
-col_l, col_r = st.columns(2)
+
+# Uploader key counter — incrementing it forces Streamlit to re-mount
+# the file_uploader widgets fresh, which clears all selected files.
+if "upload_key" not in st.session_state:
+    st.session_state.upload_key = 0
+
+col_l, col_r, col_clr = st.columns([2, 2, 1])
 with col_l:
-    left = st.file_uploader("OLD files", ["xlsx", "xls"], accept_multiple_files=True,
-                             label_visibility="visible")
+    left = st.file_uploader(
+        "OLD files", ["xlsx", "xls"], accept_multiple_files=True,
+        label_visibility="visible",
+        key=f"uploader_left_{st.session_state.upload_key}",
+    )
 with col_r:
-    right = st.file_uploader("NEW files", ["xlsx", "xls"], accept_multiple_files=True,
-                              label_visibility="visible")
+    right = st.file_uploader(
+        "NEW files", ["xlsx", "xls"], accept_multiple_files=True,
+        label_visibility="visible",
+        key=f"uploader_right_{st.session_state.upload_key}",
+    )
+with col_clr:
+    st.markdown("<div style='height:1.9rem'></div>", unsafe_allow_html=True)
+    if st.button("🗑 Clear files", key="clear_uploads",
+                 help="Remove all uploaded files and reset the session",
+                 use_container_width=True):
+        st.session_state.upload_key += 1
+        # Also wipe all derived state so nothing stale carries over
+        for k in ["header_overrides", "_hdr_files_key", "manual_pairs",
+                  "left_files", "right_files"]:
+            st.session_state.pop(k, None)
+        # Clear widget-level state for header inputs
+        for k in list(st.session_state.keys()):
+            if k.startswith("hdr_") or k.startswith("_prev_auto_"):
+                del st.session_state[k]
+        st.rerun()
 
 # ── Step 2: Config
 st.markdown('<div class="step-label" style="margin-top:1.5rem">Step 2 — Configure</div>',
@@ -1057,23 +1088,43 @@ if left or right:
                 grid = st.columns(cols_per_row)
                 for col, sh in zip(grid, chunk):
                     with col:
-                        auto_val  = auto_rows.get(sh, 1)
-                        # If user has previously overridden this sheet, use their value;
-                        # otherwise default to the auto-detected row
-                        current   = st.session_state.header_overrides.get(sh, auto_val)
+                        auto_val = auto_rows.get(sh, 1)
+                        widget_key = f"hdr_{sh}"
+
+                        # Streamlit ignores value= after the first render — it uses
+                        # the widget's own session state instead. We must seed the
+                        # widget key directly so the auto-detected value is shown
+                        # correctly when files change or auto-detection updates.
+                        if widget_key not in st.session_state:
+                            # First time this widget is rendered — seed with override
+                            # (if the user already set one) or auto-detected value.
+                            st.session_state[widget_key] = int(
+                                st.session_state.header_overrides.get(sh, auto_val)
+                            )
+
+                        # If files changed, reset widget to new auto-detected value
+                        # (files_key change already cleared header_overrides above)
+                        prev_auto_key = f"_prev_auto_{sh}"
+                        if st.session_state.get(prev_auto_key) != auto_val:
+                            st.session_state[widget_key] = int(
+                                st.session_state.header_overrides.get(sh, auto_val)
+                            )
+                            st.session_state[prev_auto_key] = auto_val
+
+                        current = st.session_state[widget_key]
                         is_overridden = (current != auto_val)
 
                         label = (
-                            f'"{sh}" ✏️'      # pencil = user-overridden
+                            f'"{sh}" ✏️'     # pencil = user-overridden
                             if is_overridden
-                            else f'"{sh}" 🤖'  # robot = using auto-detect
+                            else f'"{sh}" 🤖' # robot = using auto-detect
                         )
                         val = st.number_input(
                             label,
                             min_value=1, max_value=100,
                             value=int(current),
                             step=1,
-                            key=f"hdr_{sh}",
+                            key=widget_key,
                             help=(
                                 f"Auto-detected: row {auto_val}. "
                                 + ("Currently overridden." if is_overridden
