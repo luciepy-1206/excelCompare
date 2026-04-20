@@ -286,8 +286,81 @@ def decrypt_file_cached(data: bytes, password: str = DEFAULT_PASSWORD) -> bytes:
 
 
 def decrypt_file(uploaded_file, password: str = DEFAULT_PASSWORD) -> BytesIO:
+    # CSV/TSV/plain-text files are never encrypted — skip msoffcrypto entirely
+    if _is_tabular_text(uploaded_file.name):
+        return BytesIO(uploaded_file.getvalue())
     decrypted = decrypt_file_cached(uploaded_file.getvalue(), password)
     return BytesIO(decrypted)
+
+
+# ─────────────────────────────────────────────
+# MULTI-FORMAT FILE UTILITIES
+# ─────────────────────────────────────────────
+
+# Supported extensions and their read strategy
+_EXCEL_EXTS = {"xlsx", "xlsm"}            # openpyxl
+_EXCEL_XLS  = {"xls"}                     # xlrd (legacy)
+_EXCEL_ODS  = {"ods"}                     # odf
+_CSV_EXTS   = {"csv", "txt"}              # pd.read_csv, comma sep
+_TSV_EXTS   = {"tsv"}                     # pd.read_csv, tab sep
+ALL_SUPPORTED_EXTS = (
+    list(_EXCEL_EXTS) + list(_EXCEL_XLS) + list(_EXCEL_ODS)
+    + list(_CSV_EXTS) + list(_TSV_EXTS)
+)
+
+
+def _file_ext(filename: str) -> str:
+    """Return lowercase extension without the dot."""
+    return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+
+def _is_tabular_text(filename: str) -> bool:
+    return _file_ext(filename) in _CSV_EXTS | _TSV_EXTS
+
+
+def _sheet_name_from_filename(filename: str) -> str:
+    """For CSV/TSV, use the file stem as the sheet name."""
+    return filename.rsplit(".", 1)[0] if "." in filename else filename
+
+
+@st.cache_data(show_spinner=False)
+def _read_csv_raw_cached(data: bytes, filename: str) -> pd.DataFrame:
+    """
+    Robustly read a CSV/TSV into a raw DataFrame (header=None).
+    Tries multiple encodings and separators; returns the best parse.
+    Cached by content so repeated runs cost nothing.
+    """
+    ext = _file_ext(filename)
+    # For .tsv, try tab first; for everything else try comma first
+    sep_order = (["	", ",", ";", "|"] if ext in _TSV_EXTS
+                 else [",", "	", ";", "|"])
+    encoding_order = ["utf-8-sig", "utf-8", "latin-1", "cp1252"]
+
+    best_df: Optional[pd.DataFrame] = None
+    best_cols = 0
+
+    for enc in encoding_order:
+        for sep in sep_order:
+            try:
+                df = pd.read_csv(
+                    BytesIO(data), header=None, sep=sep,
+                    encoding=enc, engine="python",
+                    on_bad_lines="skip", dtype=str,
+                )
+                if df.shape[1] > best_cols:
+                    best_df   = df
+                    best_cols = df.shape[1]
+                    if best_cols > 1:
+                        break   # good enough, stop trying separators
+            except Exception:
+                continue
+        if best_cols > 1:
+            break
+
+    if best_df is None:
+        best_df = pd.DataFrame()
+
+    return best_df
 
 
 # ─────────────────────────────────────────────
@@ -295,14 +368,47 @@ def decrypt_file(uploaded_file, password: str = DEFAULT_PASSWORD) -> BytesIO:
 # ─────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def detect_header_rows_for_file(file_bytes_raw: bytes) -> Dict[str, int]:
+def detect_header_rows_for_file(file_bytes_raw: bytes, filename: str = "") -> Dict[str, int]:
     """
     Run smart header detection on every sheet in a file immediately after upload.
     Returns {sheet_name: detected_row (1-indexed, for display)}.
     Cached by file content so it only runs once per unique file.
+    Handles XLSX/XLSM (openpyxl), ODS (odf), XLS (xlrd), CSV/TSV (read_csv).
     """
     result: Dict[str, int] = {}
+    ext = _file_ext(filename)
+
     try:
+        # ── CSV / TSV ────────────────────────────────────────────────
+        if ext in _CSV_EXTS | _TSV_EXTS:
+            sh = _sheet_name_from_filename(filename)
+            df_raw = _read_csv_raw_cached(file_bytes_raw, filename)
+            detected = detect_header_row_heuristic(df_raw, ws=None)
+            result[sh] = detected + 1
+            return result
+
+        # ── ODS ──────────────────────────────────────────────────────
+        if ext in _EXCEL_ODS:
+            all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
+                                    header=None, engine="odf")
+            for sh, df_raw in all_raw.items():
+                detected = detect_header_row_heuristic(df_raw, ws=None)
+                result[sh] = detected + 1
+            return result
+
+        # ── XLS (legacy) ─────────────────────────────────────────────
+        if ext in _EXCEL_XLS:
+            try:
+                all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
+                                        header=None, engine="xlrd")
+                for sh, df_raw in all_raw.items():
+                    detected = detect_header_row_heuristic(df_raw, ws=None)
+                    result[sh] = detected + 1
+            except Exception:
+                pass
+            return result
+
+        # ── XLSX / XLSM (openpyxl, with style signals) ───────────────
         wb = load_workbook(BytesIO(file_bytes_raw), data_only=True)
         all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
                                 header=None, engine="openpyxl")
@@ -314,6 +420,7 @@ def detect_header_rows_for_file(file_bytes_raw: bytes) -> Dict[str, int]:
                 continue
             detected = detect_header_row_heuristic(df_raw, ws=ws)
             result[sh] = detected + 1   # convert to 1-indexed for display
+
     except Exception:
         pass
     return result
@@ -328,10 +435,9 @@ def get_auto_detected_rows(uploaded_files: list) -> Dict[str, int]:
     merged: Dict[str, int] = {}
     for uf in (uploaded_files or []):
         try:
-            rows = detect_header_rows_for_file(uf.getvalue())
+            rows = detect_header_rows_for_file(uf.getvalue(), uf.name)
             uf.seek(0)
             for sh, row in rows.items():
-                # Take the max (most conservative) if files disagree
                 merged[sh] = max(merged.get(sh, 1), row)
         except Exception:
             try:
@@ -568,29 +674,110 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
 # FILE READING  (cached + reduced read_excel calls)
 # ─────────────────────────────────────────────
 
+def _apply_header_and_dedup(
+    df_raw: pd.DataFrame,
+    header_row: int,
+) -> pd.DataFrame:
+    """Slice df_raw at header_row, strip/dedup column names, return data frame."""
+    if header_row < len(df_raw):
+        raw_cols = df_raw.iloc[header_row].tolist()
+        df_data  = df_raw.iloc[header_row + 1:].copy()
+        seen_c: Dict[str, int] = {}
+        clean_cols = []
+        for i, c in enumerate(raw_cols):
+            name = str(c).strip() if pd.notna(c) else f"Unnamed_{i}"
+            if not name or name == "nan":
+                name = f"Unnamed_{i}"
+            if name in seen_c:
+                seen_c[name] += 1
+                clean_cols.append(f"{name}_{seen_c[name]}")
+            else:
+                seen_c[name] = 0
+                clean_cols.append(name)
+        df_data.columns = clean_cols
+        df_data = df_data.reset_index(drop=True)
+    else:
+        df_data = df_raw.copy()
+        df_data.columns = [str(c).strip() for c in df_data.columns]
+
+    if isinstance(df_data.columns, pd.MultiIndex):
+        df_data.columns = [
+            " ".join(str(c) for c in col if str(c) != "nan").strip()
+            for col in df_data.columns
+        ]
+    return df_data.astype(str)
+
+
 @st.cache_data(show_spinner=False)
 def _read_sheets_cached(
     file_bytes_raw: bytes,
+    filename: str,
     key_columns_tuple: tuple,
-    header_overrides_tuple: tuple = (),  # ((sheet_name, row_idx), ...)
+    header_overrides_tuple: tuple = (),
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, int]]:
     """
-    Reads all visible sheets once, detects headers, returns DataFrames.
-    Cached by raw file bytes hash – avoids re-reading on every Streamlit rerun.
-    header_overrides_tuple: per-sheet manual header row (0-indexed).
-    When set for a sheet, auto-detection is skipped entirely.
+    Unified multi-format sheet reader. Handles:
+      XLSX / XLSM  — openpyxl (with bold/merge style signals for header detection)
+      XLS          — xlrd engine
+      ODS          — odf engine
+      CSV / TXT    — pd.read_csv, auto-detect encoding + separator
+      TSV          — pd.read_csv with tab separator
+    Returns the same {sheet_name: DataFrame} shape regardless of format.
+    CSV/TSV produce a single sheet keyed by the file stem.
     """
-    file_bytes = BytesIO(file_bytes_raw)
     key_columns = list(key_columns_tuple)
     header_overrides: Dict[str, int] = dict(header_overrides_tuple)
+    ext = _file_ext(filename)
 
+    # ── CSV / TSV ────────────────────────────────────────────────────
+    if ext in _CSV_EXTS | _TSV_EXTS:
+        sh = _sheet_name_from_filename(filename)
+        df_raw = _read_csv_raw_cached(file_bytes_raw, filename)
+        if df_raw.empty:
+            return {sh: pd.DataFrame()}, {sh: 0}
+        hr = header_overrides.get(sh,
+             find_header_row_with_keys(df_raw, key_columns) if key_columns
+             else detect_header_row_heuristic(df_raw))
+        return {sh: _apply_header_and_dedup(df_raw, hr)}, {sh: hr}
+
+    # ── ODS ──────────────────────────────────────────────────────────
+    if ext in _EXCEL_ODS:
+        try:
+            all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
+                                    header=None, engine="odf")
+            sheets, header_rows = {}, {}
+            for sh, df_raw in all_raw.items():
+                hr = header_overrides.get(sh,
+                     find_header_row_with_keys(df_raw, key_columns) if key_columns
+                     else detect_header_row_heuristic(df_raw))
+                sheets[sh] = _apply_header_and_dedup(df_raw, hr)
+                header_rows[sh] = hr
+            return sheets, header_rows
+        except Exception:
+            return {}, {}
+
+    # ── XLS (legacy) ─────────────────────────────────────────────────
+    if ext in _EXCEL_XLS:
+        try:
+            all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
+                                    header=None, engine="xlrd")
+            sheets, header_rows = {}, {}
+            for sh, df_raw in all_raw.items():
+                hr = header_overrides.get(sh,
+                     find_header_row_with_keys(df_raw, key_columns) if key_columns
+                     else detect_header_row_heuristic(df_raw))
+                sheets[sh] = _apply_header_and_dedup(df_raw, hr)
+                header_rows[sh] = hr
+            return sheets, header_rows
+        except Exception:
+            return {}, {}
+
+    # ── XLSX / XLSM (openpyxl — default, with style signals) ─────────
+    file_bytes = BytesIO(file_bytes_raw)
     try:
         wb = load_workbook(file_bytes, data_only=True)
-        # Include all sheets: visible, hidden, and very-hidden
-        # Users may need to compare hidden sheets (e.g. Lookups in OLD file)
-        visible_sheets = [ws.title for ws in wb.worksheets]
+        all_sheets = [ws.title for ws in wb.worksheets]
 
-        # Read ALL sheets in one pass (no per-sheet re-seek)
         file_bytes.seek(0)
         all_raw: Dict[str, pd.DataFrame] = pd.read_excel(
             file_bytes, sheet_name=None, header=None, engine="openpyxl"
@@ -599,13 +786,13 @@ def _read_sheets_cached(
         sheets: Dict[str, pd.DataFrame] = {}
         header_rows: Dict[str, int] = {}
 
-        for sh in visible_sheets:
+        for sh in all_sheets:
             if sh not in all_raw:
                 continue
             df_raw = all_raw[sh]
-
-            # Detect visible columns via column_dimensions
             ws = wb[sh]
+
+            # Filter hidden columns
             visible_col_indices = [
                 col_idx - 1
                 for col_idx in range(1, ws.max_column + 1)
@@ -615,56 +802,22 @@ def _read_sheets_cached(
             ]
             if not visible_col_indices:
                 visible_col_indices = list(range(df_raw.shape[1]))
-
             if len(visible_col_indices) < df_raw.shape[1]:
                 df_raw = df_raw.iloc[:, visible_col_indices].copy()
 
-            # Detect header row — manual override takes priority
             if sh in header_overrides:
-                header_row = header_overrides[sh]
+                hr = header_overrides[sh]
             elif key_columns:
-                header_row = find_header_row_with_keys(df_raw, key_columns, ws=ws)
+                hr = find_header_row_with_keys(df_raw, key_columns, ws=ws)
             else:
-                header_row = detect_header_row_heuristic(df_raw, ws=ws)
+                hr = detect_header_row_heuristic(df_raw, ws=ws)
 
-            # Slice header + data in-memory (no second read_excel)
-            # Strip whitespace from col names (merged cells leave trailing spaces)
-            # and use consistent _N dedup to match NEW file reader
-            if header_row < len(df_raw):
-                raw_cols = df_raw.iloc[header_row].tolist()
-                df_data  = df_raw.iloc[header_row + 1:].copy()
-                seen_c: Dict[str, int] = {}
-                clean_cols = []
-                for i, c in enumerate(raw_cols):
-                    name = str(c).strip() if pd.notna(c) else f"Unnamed_{i}"
-                    if not name or name == "nan":
-                        name = f"Unnamed_{i}"
-                    if name in seen_c:
-                        seen_c[name] += 1
-                        clean_cols.append(f"{name}_{seen_c[name]}")
-                    else:
-                        seen_c[name] = 0
-                        clean_cols.append(name)
-                df_data.columns = clean_cols
-                df_data = df_data.reset_index(drop=True)
-            else:
-                df_data = df_raw.copy()
-                df_data.columns = [str(c).strip() for c in df_data.columns]
-
-            # Flatten MultiIndex columns if present
-            if isinstance(df_data.columns, pd.MultiIndex):
-                df_data.columns = [
-                    " ".join(str(c) for c in col if str(c) != "nan").strip()
-                    for col in df_data.columns
-                ]
-
-            sheets[sh]      = df_data.astype(str)
-            header_rows[sh] = header_row
+            sheets[sh]      = _apply_header_and_dedup(df_raw, hr)
+            header_rows[sh] = hr
 
         return sheets, header_rows
 
     except Exception:
-        # Fallback: simple read_excel with header=0
         file_bytes.seek(0)
         fallback = pd.read_excel(file_bytes, sheet_name=None, engine="openpyxl")
         for sh in fallback:
@@ -674,12 +827,13 @@ def _read_sheets_cached(
 
 def read_visible_sheets_with_header_detection(
     file_bytes: BytesIO,
+    filename: str = "",
     key_columns: List[str] = None,
     header_overrides: Dict[str, int] = None,
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, int]]:
     raw = file_bytes.read()
     overrides_tuple = tuple(sorted((header_overrides or {}).items()))
-    return _read_sheets_cached(raw, tuple(key_columns or []), overrides_tuple)
+    return _read_sheets_cached(raw, filename, tuple(key_columns or []), overrides_tuple)
 
 
 # ─────────────────────────────────────────────
@@ -1006,13 +1160,13 @@ if "upload_key" not in st.session_state:
 col_l, col_r, col_clr = st.columns([2, 2, 1])
 with col_l:
     left = st.file_uploader(
-        "OLD files", ["xlsx", "xls"], accept_multiple_files=True,
+        "OLD files", ALL_SUPPORTED_EXTS, accept_multiple_files=True,
         label_visibility="visible",
         key=f"uploader_left_{st.session_state.upload_key}",
     )
 with col_r:
     right = st.file_uploader(
-        "NEW files", ["xlsx", "xls"], accept_multiple_files=True,
+        "NEW files", ALL_SUPPORTED_EXTS, accept_multiple_files=True,
         label_visibility="visible",
         key=f"uploader_right_{st.session_state.upload_key}",
     )
@@ -1306,14 +1460,14 @@ if left and right:
                     if row is not None
                 }
                 shL, header_rows_old = read_visible_sheets_with_header_detection(
-                    decL, key_columns=keys, header_overrides=header_overrides
+                    decL, filename=lf.name, key_columns=keys, header_overrides=header_overrides
                 )
 
                 # Read NEW file through the SAME cached pipeline as OLD
                 # so it gets its own independent auto-detection with style signals.
                 # Override priority: user override > NEW's own detection > OLD's detection
                 shR, header_rows_new = read_visible_sheets_with_header_detection(
-                    decR, key_columns=keys, header_overrides=header_overrides
+                    decR, filename=rf.name, key_columns=keys, header_overrides=header_overrides
                 )
 
                 # Align NEW column names to OLD column names for every shared sheet
