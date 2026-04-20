@@ -1036,6 +1036,73 @@ def compare_keyless(df1, df2):
     return added, removed
 
 
+def reconcile_added_removed(
+    removed: pd.DataFrame,
+    added:   pd.DataFrame,
+    norm_removed: pd.DataFrame,
+    norm_added:   pd.DataFrame,
+    similarity_threshold: float = 0.5,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    After a keyless diff produces 'added' and 'removed' pools, match rows that
+    are similar enough to be treated as *modified* rather than truly gone/new.
+
+    A removed row and an added row are paired when they share ≥ similarity_threshold
+    of their normalized cell values (default 50%).  Greedy matching — each row
+    is used at most once.
+
+    Returns:
+        changed_old  — removed rows that have a close match in added
+        changed_new  — their counterparts from added
+        truly_removed — removed rows with no good match (genuinely gone)
+        truly_added   — added rows with no good match (genuinely new)
+    """
+    if removed.empty or added.empty:
+        return pd.DataFrame(), pd.DataFrame(), removed.copy(), added.copy()
+
+    common = list(norm_removed.columns.intersection(norm_added.columns))
+    if not common:
+        return pd.DataFrame(), pd.DataFrame(), removed.copy(), added.copy()
+
+    nr = norm_removed[common].reset_index(drop=True)
+    na = norm_added[common].reset_index(drop=True)
+    rem_raw = removed.reset_index(drop=True)
+    add_raw = added.reset_index(drop=True)
+
+    matched_rem: set[int] = set()
+    matched_add: set[int] = set()
+    changed_old_rows: list = []
+    changed_new_rows: list = []
+
+    n_cols = len(common)
+
+    for ri in range(len(nr)):
+        best_sim, best_ai = 0.0, -1
+        r1 = nr.iloc[ri]
+        for ai in range(len(na)):
+            if ai in matched_add:
+                continue
+            r2 = na.iloc[ai]
+            matches = sum(1 for c in common if str(r1[c]) == str(r2[c]))
+            sim = matches / n_cols
+            if sim > best_sim:
+                best_sim, best_ai = sim, ai
+
+        if best_sim >= similarity_threshold and best_ai >= 0:
+            matched_rem.add(ri)
+            matched_add.add(best_ai)
+            changed_old_rows.append(rem_raw.iloc[ri])
+            changed_new_rows.append(add_raw.iloc[best_ai])
+
+    co = (pd.DataFrame(changed_old_rows).reset_index(drop=True)
+          if changed_old_rows else pd.DataFrame(columns=removed.columns))
+    cn = (pd.DataFrame(changed_new_rows).reset_index(drop=True)
+          if changed_new_rows else pd.DataFrame(columns=added.columns))
+    truly_removed = rem_raw.loc[~rem_raw.index.isin(matched_rem)].reset_index(drop=True)
+    truly_added   = add_raw.loc[~add_raw.index.isin(matched_add)].reset_index(drop=True)
+    return co, cn, truly_removed, truly_added
+
+
 def detect_data_truncation(df1: pd.DataFrame, df2: pd.DataFrame) -> Tuple[bool, int, int]:
     old_rows = int(df1.apply(lambda r: r.notna().any(), axis=1).sum())
     new_rows = int(df2.apply(lambda r: r.notna().any(), axis=1).sum())
@@ -1509,6 +1576,15 @@ if left and right:
                     else:
                         co = cn = pd.DataFrame()
                         add, rem = compare_keyless(d1, d2)
+                        # Reconcile: rows that look mostly the same are shown as
+                        # "changed" with cell-level highlighting instead of separate
+                        # removed + added tables (catches missing/blank cell changes)
+                        if not add.empty and not rem.empty:
+                            n_rem = normalize_df(rem)
+                            n_add = normalize_df(add)
+                            co, cn, rem, add = reconcile_added_removed(
+                                rem, add, n_rem, n_add
+                            )
                 except Exception:
                     co = cn = pd.DataFrame()
                     add, rem = compare_keyless(d1, d2)
@@ -1621,21 +1697,23 @@ if left and right:
                             unsafe_allow_html=True,
                         )
 
-                    if not cn.empty and use_key:
+                    if not cn.empty:
+                        # Side-by-side view with cell-level highlighting for both
+                        # key-based changes and keyless reconciled changes.
+                        # For keyless, pass empty keys so no column is treated as
+                        # an immutable key, letting every column be highlighted.
+                        preview_keys = keys if use_key else []
                         st.markdown('<span class="diff-label changed">🔄 Changed rows</span>',
                                     unsafe_allow_html=True)
-                        st.dataframe(build_side_by_side_preview(co, cn, keys), use_container_width=True)
+                        st.dataframe(build_side_by_side_preview(co, cn, preview_keys),
+                                     use_container_width=True)
                         st.download_button(
                             "📥 Download changes (.xlsx)",
-                            export_to_excel(co, cn, keys),
+                            export_to_excel(co, cn, preview_keys),
                             file_name=f"Pair{file_num}_{sh}_changes.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key=f"dl_{file_num}_{sh}",
                         )
-                    elif not cn.empty:
-                        st.markdown('<span class="diff-label changed">🔄 Changed rows</span>',
-                                    unsafe_allow_html=True)
-                        st.dataframe(cn, use_container_width=True)
 
                     if not add.empty:
                         st.markdown('<span class="diff-label added">➕ Added rows</span>',
