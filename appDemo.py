@@ -1128,21 +1128,27 @@ def build_side_by_side_preview(changed_old: pd.DataFrame, changed_new: pd.DataFr
         rows.append(row)
     combined = pd.DataFrame(rows)
 
+    # Shared cols — only highlight when BOTH frames have the column,
+    # preventing KeyError when keyless reconciled rows have asymmetric columns.
+    shared = set(old_norm.columns) & set(new_norm.columns)
+
     def highlight(row):
         styles = []
         ridx = row.name
         for col in combined.columns:
             if col.endswith(" (Old)"):
                 base = col[:-6]
-                changed = (base in old_norm.columns and
+                changed = (base in shared and
                            str(old_norm.iloc[ridx][base]) != str(new_norm.iloc[ridx][base]))
+                # Red tint for changed old value, plain green for unchanged
                 styles.append('background-color: #3b1212; color: #fca5a5' if changed
                                else 'background-color: #0f2a1a; color: #86efac')
             elif col.endswith(" (New)"):
                 base = col[:-6]
-                changed = (base in new_norm.columns and
+                changed = (base in shared and
                            str(old_norm.iloc[ridx][base]) != str(new_norm.iloc[ridx][base]))
-                styles.append('background-color: #0f2a1a; color: #86efac' if changed
+                # Bright green for changed new value, plain green for unchanged
+                styles.append('background-color: #14532d; color: #4ade80' if changed
                                else 'background-color: #0f2a1a; color: #86efac')
             else:
                 styles.append('')
@@ -1193,17 +1199,24 @@ def export_to_excel(changed_old: pd.DataFrame, changed_new: pd.DataFrame, keys: 
     old_norm = normalize_df(changed_old)
     new_norm = normalize_df(changed_new)
 
-    for ws, df, fill, norm_other in [
-        (ws_old, changed_old, fill_old, new_norm),
-        (ws_new, changed_new, fill_new, old_norm),
+    # Pre-compute columns present in BOTH norm frames so the highlight
+    # check never accesses a missing column — guards the KeyError that
+    # occurs when keyless reconciled rows have asymmetric columns.
+    shared_cols = set(old_norm.columns) & set(new_norm.columns)
+
+    for ws, df, fill in [
+        (ws_old, changed_old, fill_old),
+        (ws_new, changed_new, fill_new),
     ]:
         for c, col_name in enumerate(df.columns, 1):
             ws.cell(row=1, column=c, value=col_name)
         for r_idx in range(len(df)):
             for c_idx, col_name in enumerate(df.columns, 1):
                 cell = ws.cell(row=r_idx + 2, column=c_idx, value=df.iloc[r_idx][col_name])
-                if (col_name not in keys and col_name in old_norm.columns and
-                        str(old_norm.iloc[r_idx][col_name]) != str(new_norm.iloc[r_idx][col_name])):
+                if (col_name not in keys
+                        and col_name in shared_cols
+                        and str(old_norm.iloc[r_idx][col_name])
+                            != str(new_norm.iloc[r_idx][col_name])):
                     cell.fill = fill
 
     out = BytesIO()
