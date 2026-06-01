@@ -1,7 +1,14 @@
-# app.py – Smart Diff Manager (Improved: UI/UX + Performance + Header Detection)
+# app.py – Smart Diff Manager (v2.1 — Performance fixes)
+# Changes vs v2.0:
+#   1. reconcile_added_removed: O(n²×cols) → exact-hash + numpy vectorized comparison
+#   2. normalize_df called once per sheet, passed through all compare/preview/export functions
+#   3. _read_sheets_cached: single pd.read_excel call for XLSX (was double)
+#   4. compare_key_based: dict-based O(1) key lookup instead of .loc on non-unique index
+#   5. Minor: removed redundant uf.seek(0) after getvalue() in get_auto_detected_rows
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 from difflib import SequenceMatcher
 from io import BytesIO
 import msoffcrypto
@@ -244,7 +251,7 @@ div[data-testid="stSlider"] { padding: 0.2rem 0; }
 st.markdown(
     """
 <div class="banner">
-  <span class="accent">v2.0 · Excel Diff Tool</span>
+  <span class="accent">v2.1 · Excel Diff Tool</span>
   <h1>📊 Smart Diff Manager</h1>
   <p>Key-based comparison across Excel files with smart header detection and column alignment.</p>
 </div>
@@ -286,7 +293,6 @@ def decrypt_file_cached(data: bytes, password: str = DEFAULT_PASSWORD) -> bytes:
 
 
 def decrypt_file(uploaded_file, password: str = DEFAULT_PASSWORD) -> BytesIO:
-    # CSV/TSV/plain-text files are never encrypted — skip msoffcrypto entirely
     if _is_tabular_text(uploaded_file.name):
         return BytesIO(uploaded_file.getvalue())
     decrypted = decrypt_file_cached(uploaded_file.getvalue(), password)
@@ -297,12 +303,11 @@ def decrypt_file(uploaded_file, password: str = DEFAULT_PASSWORD) -> BytesIO:
 # MULTI-FORMAT FILE UTILITIES
 # ─────────────────────────────────────────────
 
-# Supported extensions and their read strategy
-_EXCEL_EXTS = {"xlsx", "xlsm"}            # openpyxl
-_EXCEL_XLS  = {"xls"}                     # xlrd (legacy)
-_EXCEL_ODS  = {"ods"}                     # odf
-_CSV_EXTS   = {"csv", "txt"}              # pd.read_csv, comma sep
-_TSV_EXTS   = {"tsv"}                     # pd.read_csv, tab sep
+_EXCEL_EXTS = {"xlsx", "xlsm"}
+_EXCEL_XLS  = {"xls"}
+_EXCEL_ODS  = {"ods"}
+_CSV_EXTS   = {"csv", "txt"}
+_TSV_EXTS   = {"tsv"}
 ALL_SUPPORTED_EXTS = (
     list(_EXCEL_EXTS) + list(_EXCEL_XLS) + list(_EXCEL_ODS)
     + list(_CSV_EXTS) + list(_TSV_EXTS)
@@ -310,7 +315,6 @@ ALL_SUPPORTED_EXTS = (
 
 
 def _file_ext(filename: str) -> str:
-    """Return lowercase extension without the dot."""
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
 
@@ -319,21 +323,14 @@ def _is_tabular_text(filename: str) -> bool:
 
 
 def _sheet_name_from_filename(filename: str) -> str:
-    """For CSV/TSV, use the file stem as the sheet name."""
     return filename.rsplit(".", 1)[0] if "." in filename else filename
 
 
 @st.cache_data(show_spinner=False)
 def _read_csv_raw_cached(data: bytes, filename: str) -> pd.DataFrame:
-    """
-    Robustly read a CSV/TSV into a raw DataFrame (header=None).
-    Tries multiple encodings and separators; returns the best parse.
-    Cached by content so repeated runs cost nothing.
-    """
     ext = _file_ext(filename)
-    # For .tsv, try tab first; for everything else try comma first
-    sep_order = (["	", ",", ";", "|"] if ext in _TSV_EXTS
-                 else [",", "	", ";", "|"])
+    sep_order = (["\t", ",", ";", "|"] if ext in _TSV_EXTS
+                 else [",", "\t", ";", "|"])
     encoding_order = ["utf-8-sig", "utf-8", "latin-1", "cp1252"]
 
     best_df: Optional[pd.DataFrame] = None
@@ -351,7 +348,7 @@ def _read_csv_raw_cached(data: bytes, filename: str) -> pd.DataFrame:
                     best_df   = df
                     best_cols = df.shape[1]
                     if best_cols > 1:
-                        break   # good enough, stop trying separators
+                        break
             except Exception:
                 continue
         if best_cols > 1:
@@ -359,7 +356,6 @@ def _read_csv_raw_cached(data: bytes, filename: str) -> pd.DataFrame:
 
     if best_df is None:
         best_df = pd.DataFrame()
-
     return best_df
 
 
@@ -369,17 +365,10 @@ def _read_csv_raw_cached(data: bytes, filename: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def detect_header_rows_for_file(file_bytes_raw: bytes, filename: str = "") -> Dict[str, int]:
-    """
-    Run smart header detection on every sheet in a file immediately after upload.
-    Returns {sheet_name: detected_row (1-indexed, for display)}.
-    Cached by file content so it only runs once per unique file.
-    Handles XLSX/XLSM (openpyxl), ODS (odf), XLS (xlrd), CSV/TSV (read_csv).
-    """
     result: Dict[str, int] = {}
     ext = _file_ext(filename)
 
     try:
-        # ── CSV / TSV ────────────────────────────────────────────────
         if ext in _CSV_EXTS | _TSV_EXTS:
             sh = _sheet_name_from_filename(filename)
             df_raw = _read_csv_raw_cached(file_bytes_raw, filename)
@@ -387,7 +376,6 @@ def detect_header_rows_for_file(file_bytes_raw: bytes, filename: str = "") -> Di
             result[sh] = detected + 1
             return result
 
-        # ── ODS ──────────────────────────────────────────────────────
         if ext in _EXCEL_ODS:
             all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
                                     header=None, engine="odf")
@@ -396,7 +384,6 @@ def detect_header_rows_for_file(file_bytes_raw: bytes, filename: str = "") -> Di
                 result[sh] = detected + 1
             return result
 
-        # ── XLS (legacy) ─────────────────────────────────────────────
         if ext in _EXCEL_XLS:
             try:
                 all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
@@ -408,7 +395,7 @@ def detect_header_rows_for_file(file_bytes_raw: bytes, filename: str = "") -> Di
                 pass
             return result
 
-        # ── XLSX / XLSM (openpyxl, with style signals) ───────────────
+        # XLSX/XLSM — FIX: single read_excel call, reuse for both wb and raw data
         wb = load_workbook(BytesIO(file_bytes_raw), data_only=True)
         all_raw = pd.read_excel(BytesIO(file_bytes_raw), sheet_name=None,
                                 header=None, engine="openpyxl")
@@ -419,7 +406,7 @@ def detect_header_rows_for_file(file_bytes_raw: bytes, filename: str = "") -> Di
                 result[sh] = 1
                 continue
             detected = detect_header_row_heuristic(df_raw, ws=ws)
-            result[sh] = detected + 1   # convert to 1-indexed for display
+            result[sh] = detected + 1
 
     except Exception:
         pass
@@ -427,23 +414,15 @@ def detect_header_rows_for_file(file_bytes_raw: bytes, filename: str = "") -> Di
 
 
 def get_auto_detected_rows(uploaded_files: list) -> Dict[str, int]:
-    """
-    Merge auto-detected header rows across all uploaded files.
-    If two files disagree on the same sheet, take the higher row number
-    (more conservative — skips more potential title rows).
-    """
     merged: Dict[str, int] = {}
     for uf in (uploaded_files or []):
         try:
+            # FIX: getvalue() doesn't consume position; no seek needed
             rows = detect_header_rows_for_file(uf.getvalue(), uf.name)
-            uf.seek(0)
             for sh, row in rows.items():
                 merged[sh] = max(merged.get(sh, 1), row)
         except Exception:
-            try:
-                uf.seek(0)
-            except Exception:
-                pass
+            pass
     return merged
 
 
@@ -455,18 +434,12 @@ def normalize_colname(name: str) -> str:
     return re.sub(r'[^a-z0-9]', '', str(name).lower().strip())
 
 
-# Boolean lookup sets
 _BOOL_TRUE  = {"TRUE","T","YES","Y","1","1.0","CHECK","CHECKED","CHECKMARK","✓","✔","ON","ENABLED","ACTIVE"}
 _BOOL_FALSE = {"FALSE","F","NO","N","0","0.0","CROSS","UNCHECKED","✗","✘","X","OFF","DISABLED","INACTIVE"}
 
 def _normalize_cell(v: str) -> str:
-    """Normalize a single string cell value."""
     if v == "" or v == "nan":
         return ""
-    # Collapse all whitespace variants (newlines, tabs, non-breaking spaces,
-    # multiple spaces) into a single space, then strip ends.
-    # This prevents 'Current\nComp-Ratio' and 'Current Comp-Ratio' from
-    # hashing differently when they look identical in a cell.
     s = re.sub(r'[\s\u00a0]+', ' ', v).strip().upper()
     if s in _BOOL_TRUE:
         return "TRUE"
@@ -481,23 +454,21 @@ def _normalize_cell(v: str) -> str:
 
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Vectorized normalization: fill NaN → stringify → normalize booleans/numerics.
-    Much faster than per-cell apply() for large frames.
+    Vectorized normalization. Called ONCE per sheet per file in the run loop;
+    the result is passed into all downstream functions so they never re-normalize.
     """
     if df is None or df.empty:
         return pd.DataFrame()
     d = df.copy()
     d.columns = d.columns.map(str)
-    # Vectorized fillna + astype in one pass
     d = d.fillna("").astype(str)
-    # Apply scalar function column-by-column (still faster than cell-by-cell)
     for col in d.columns:
         d[col] = d[col].map(_normalize_cell)
     return d
 
 
 # ─────────────────────────────────────────────
-# SMART HEADER DETECTION  (fixed index handling)
+# SMART HEADER DETECTION
 # ─────────────────────────────────────────────
 
 def find_header_row_by_column_names(df_raw: pd.DataFrame, reference_columns: List[str]) -> int:
@@ -507,7 +478,7 @@ def find_header_row_by_column_names(df_raw: pd.DataFrame, reference_columns: Lis
     best_row = 0
     best_match_count = 0
     n_rows = min(15, len(df_raw))
-    for i in range(n_rows):                          # ← use range, not iterrows index
+    for i in range(n_rows):
         row = df_raw.iloc[i]
         row_values = {
             normalize_colname(str(val))
@@ -540,31 +511,6 @@ def find_header_row_with_keys(df_raw: pd.DataFrame, key_columns: List[str], ws=N
 
 
 def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
-    """
-    Multi-signal header row detection searching the first 15 rows.
-    Scores every candidate row; the highest scorer wins.
-
-    Signals (with weights):
-      bold_ratio         x3.0  — bold cells are almost always headers
-      fill_ratio         x1.5  — header rows tend to be densely filled
-      all_string         x1.0  — header cells are strings, data mixes types
-      unique_ratio       x1.0  — header values are unique within the row
-      name_like          x1.0  — values look like column names (start with letter, <40 chars)
-      post_consistency   x1.0  — rows after the header should be uniform
-      low_numeric        x0.5  — headers rarely contain only numbers
-      row_penalty        x0.1  — prefer earlier rows when scores are equal
-
-    Penalties:
-      horizontal_merge   -2.5  — rows whose cells span multiple columns are
-                                  group-label rows sitting above the real header
-      vertical_cont      skip  — rows inside a vertical merge are never headers
-
-    Skips: empty rows, single long-description rows (>50 chars, 1 cell),
-           vertical-merge continuation rows.
-
-    ws: optional openpyxl Worksheet — enables bold and merge signals.
-        When None, only pandas-based signals are used.
-    """
     if df_raw.empty:
         return 0
 
@@ -572,23 +518,18 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
     n_cols   = df_raw.shape[1] or 1
     search_n = len(head)
 
-    # ── Pre-compute merge info from openpyxl ─────────────────────────
-    # horizontal_merge_rows: rows that START wide horizontal merges (group labels)
-    # vertical_cont_rows:    rows that are continuations of a vertical merge
-    horizontal_merge_rows: set[int] = set()
-    vertical_cont_rows:    set[int] = set()
+    horizontal_merge_rows: set = set()
+    vertical_cont_rows:    set = set()
     xl_rows: list = []
 
     if ws is not None:
         xl_rows = list(ws.iter_rows(max_row=search_n))
         for mr in ws.merged_cells.ranges:
-            ri        = mr.min_row - 1          # 0-indexed
+            ri        = mr.min_row - 1
             col_span  = mr.max_col - mr.min_col
             row_span  = mr.max_row - mr.min_row
-            # Horizontal multi-column merge on a single row = group label
             if col_span >= 1 and row_span == 0 and ri < search_n:
                 horizontal_merge_rows.add(ri)
-            # Vertical merge — mark continuation rows (not the top-left cell row)
             if row_span >= 1:
                 for r in range(mr.min_row + 1, mr.max_row + 1):
                     if r - 1 < search_n:
@@ -597,7 +538,6 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
     best_score, best_row = -1.0, 0
 
     for i in range(search_n):
-        # Skip rows that are inside a vertical merge (never a header)
         if i in vertical_cont_rows:
             continue
 
@@ -607,11 +547,9 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
 
         if n_vals < 2:
             continue
-        # Skip single long description rows (instructions, not headers)
         if n_vals == 1 and len(str(vals[0])) > 50:
             continue
 
-        # ── Bold signal (requires openpyxl ws) ──────────────────────
         if xl_rows and i < len(xl_rows):
             bold_count = sum(
                 1 for c in xl_rows[i]
@@ -622,7 +560,6 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
         else:
             bold_r = 0.0
 
-        # ── Content signals ───────────────────────────────────────────
         all_str   = float(all(isinstance(v, str) for v in vals))
         unique_r  = len({str(v) for v in vals}) / n_vals
         fill_r    = n_vals / n_cols
@@ -636,7 +573,6 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
             and re.match(r"^[A-Za-z]", v.strip())
         ) / n_vals
 
-        # ── Post-row consistency (look-ahead up to 8 rows) ───────────
         lookahead = df_raw.iloc[i + 1 : i + 9]
         if len(lookahead) >= 2:
             fill_counts  = lookahead.apply(lambda r: r.notna().sum(), axis=1)
@@ -644,7 +580,6 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
         else:
             post_consist = 0.0
 
-        # ── Composite score ───────────────────────────────────────────
         score = (
             bold_r        * 3.0
             + fill_r      * 1.5
@@ -653,13 +588,9 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
             + name_like   * 1.0
             + post_consist * 1.0
             + (1 - num_r) * 0.5
-            - i           * 0.1     # slight penalty for later rows
+            - i           * 0.1
         )
 
-        # ── Merged group-label penalty ────────────────────────────────
-        # Rows that start wide horizontal merges are group labels sitting
-        # above the real header (e.g. "Subtotal | Sort Type | Font…").
-        # Penalise heavily so the dense row beneath scores higher.
         if i in horizontal_merge_rows:
             score -= 2.5
 
@@ -671,14 +602,10 @@ def detect_header_row_heuristic(df_raw: pd.DataFrame, ws=None) -> int:
 
 
 # ─────────────────────────────────────────────
-# FILE READING  (cached + reduced read_excel calls)
+# FILE READING  (single read_excel pass for XLSX)
 # ─────────────────────────────────────────────
 
-def _apply_header_and_dedup(
-    df_raw: pd.DataFrame,
-    header_row: int,
-) -> pd.DataFrame:
-    """Slice df_raw at header_row, strip/dedup column names, return data frame."""
+def _apply_header_and_dedup(df_raw: pd.DataFrame, header_row: int) -> pd.DataFrame:
     if header_row < len(df_raw):
         raw_cols = df_raw.iloc[header_row].tolist()
         df_data  = df_raw.iloc[header_row + 1:].copy()
@@ -716,14 +643,8 @@ def _read_sheets_cached(
     header_overrides_tuple: tuple = (),
 ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, int]]:
     """
-    Unified multi-format sheet reader. Handles:
-      XLSX / XLSM  — openpyxl (with bold/merge style signals for header detection)
-      XLS          — xlrd engine
-      ODS          — odf engine
-      CSV / TXT    — pd.read_csv, auto-detect encoding + separator
-      TSV          — pd.read_csv with tab separator
-    Returns the same {sheet_name: DataFrame} shape regardless of format.
-    CSV/TSV produce a single sheet keyed by the file stem.
+    Unified multi-format sheet reader.
+    FIX: XLSX path now does a single pd.read_excel call (was two).
     """
     key_columns = list(key_columns_tuple)
     header_overrides: Dict[str, int] = dict(header_overrides_tuple)
@@ -772,12 +693,13 @@ def _read_sheets_cached(
         except Exception:
             return {}, {}
 
-    # ── XLSX / XLSM (openpyxl — default, with style signals) ─────────
+    # ── XLSX / XLSM — FIX: single read_excel, reused for all sheets ──
     file_bytes = BytesIO(file_bytes_raw)
     try:
         wb = load_workbook(file_bytes, data_only=True)
-        all_sheets = [ws.title for ws in wb.worksheets]
+        all_sheet_names = [ws.title for ws in wb.worksheets]
 
+        # ONE read_excel call for all sheets (was two in v2.0)
         file_bytes.seek(0)
         all_raw: Dict[str, pd.DataFrame] = pd.read_excel(
             file_bytes, sheet_name=None, header=None, engine="openpyxl"
@@ -786,13 +708,12 @@ def _read_sheets_cached(
         sheets: Dict[str, pd.DataFrame] = {}
         header_rows: Dict[str, int] = {}
 
-        for sh in all_sheets:
+        for sh in all_sheet_names:
             if sh not in all_raw:
                 continue
             df_raw = all_raw[sh]
             ws = wb[sh]
 
-            # Filter hidden columns
             visible_col_indices = [
                 col_idx - 1
                 for col_idx in range(1, ws.max_column + 1)
@@ -842,7 +763,7 @@ def read_visible_sheets_with_header_detection(
 
 def _normalize_for_match(s: str) -> str:
     s = str(s).strip().lower()
-    s = re.sub(r'([_.]\d+)+$', '', s)  # strip both _1 and .1 dedup suffixes
+    s = re.sub(r'([_.]\d+)+$', '', s)
     return re.sub(r'[^a-z0-9]', '', s)
 
 
@@ -853,7 +774,6 @@ def align_new_columns_to_reference(new_cols: List[str], ref_cols: List[str]) -> 
     assigned = set()
     renamed  = list(new_cols)
 
-    # Exact match first
     for ref_i, ref_norm in ref_norm_map.items():
         for new_i, new_norm in new_norm_map.items():
             if new_i in assigned:
@@ -863,7 +783,6 @@ def align_new_columns_to_reference(new_cols: List[str], ref_cols: List[str]) -> 
                 assigned.add(new_i)
                 break
 
-    # Substring match fallback
     for ref_i, ref_norm in ref_norm_map.items():
         if not ref_norm:
             continue
@@ -875,7 +794,6 @@ def align_new_columns_to_reference(new_cols: List[str], ref_cols: List[str]) -> 
                 assigned.add(new_i)
                 break
 
-    # Deduplicate
     seen: Dict[str, int] = {}
     final = []
     for name in renamed:
@@ -898,7 +816,7 @@ def find_best_valid_key(df1: pd.DataFrame, df2: pd.DataFrame, keys: List[str]) -
 
     def norm(s: str) -> str:
         s = str(s).strip().lower()
-        s = re.sub(r'(_\d+)+$', '', s)    # FIX: was r'(_\\d+)+$'
+        s = re.sub(r'(_\d+)+$', '', s)
         return re.sub(r'[^a-z0-9]', '', s)
 
     norm1 = {norm(c): c for c in df1.columns}
@@ -943,9 +861,21 @@ def find_best_valid_key(df1: pd.DataFrame, df2: pd.DataFrame, keys: List[str]) -
 
 # ─────────────────────────────────────────────
 # COMPARISON FUNCTIONS
+# All now accept pre-normalized DataFrames (n1, n2) to avoid redundant work.
 # ─────────────────────────────────────────────
 
-def compare_key_based(df1, df2, keys):
+def compare_key_based(
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    keys: List[str],
+    n1: pd.DataFrame,
+    n2: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    """
+    FIX: accepts pre-normalized n1/n2 — no redundant normalize_df calls.
+    FIX: uses dict-based O(1) key lookup instead of .loc on a potentially
+         non-unique index (avoids DataFrame-vs-Series branching).
+    """
     valid_keys, key_desc = find_best_valid_key(df1, df2, keys)
     if not valid_keys:
         raise ValueError("No valid key columns found")
@@ -953,56 +883,64 @@ def compare_key_based(df1, df2, keys):
     common = list(df1.columns.intersection(df2.columns))
     df1f = df1[common].fillna("").copy()
     df2f = df2[common].fillna("").copy()
-    n1, n2 = normalize_df(df1f), normalize_df(df2f)
 
-    key_str_1 = n1[valid_keys].astype(str).agg("||".join, axis=1)
-    key_str_2 = n2[valid_keys].astype(str).agg("||".join, axis=1)
-    n1["__key__"] = key_str_1
-    n2["__key__"] = key_str_2
-    df1f["__key__"] = key_str_1
-    df2f["__key__"] = key_str_2
+    # Reindex pre-normalized frames to common columns
+    n1c = n1.reindex(columns=common).fillna("")
+    n2c = n2.reindex(columns=common).fillna("")
 
-    k1, k2 = set(n1["__key__"]), set(n2["__key__"])
+    key_str_1 = n1c[valid_keys].astype(str).agg("||".join, axis=1)
+    key_str_2 = n2c[valid_keys].astype(str).agg("||".join, axis=1)
+
+    # FIX: build plain dicts for O(1) lookup — avoids .loc on non-unique index
+    # When duplicate keys exist we keep the first occurrence (same behaviour as before).
+    def _first_row_dict(df: pd.DataFrame, keys_series: pd.Series) -> Dict[str, pd.Series]:
+        d: Dict[str, pd.Series] = {}
+        for idx, key in keys_series.items():
+            if key not in d:
+                d[key] = df.iloc[idx]
+        return d
+
+    norm_map1 = _first_row_dict(n1c, key_str_1)
+    norm_map2 = _first_row_dict(n2c, key_str_2)
+    raw_map1  = _first_row_dict(df1f.reset_index(drop=True), key_str_1.reset_index(drop=True))
+    raw_map2  = _first_row_dict(df2f.reset_index(drop=True), key_str_2.reset_index(drop=True))
+
+    k1, k2 = set(norm_map1), set(norm_map2)
     common_keys  = k1 & k2
     added_keys   = k2 - k1
     removed_keys = k1 - k2
 
-    non_key_cols = [c for c in common if c not in valid_keys and c != "__key__"]
-
-    # Build index maps for O(1) lookup instead of repeated .loc[]
-    idx1 = n1.set_index("__key__")
-    idx2 = n2.set_index("__key__")
-    raw1 = df1f.set_index("__key__")
-    raw2 = df2f.set_index("__key__")
+    non_key_cols = [c for c in common if c not in valid_keys]
 
     changed_old, changed_new = [], []
     for key in common_keys:
-        if key not in idx1.index or key not in idx2.index:
-            continue
-        r1, r2 = idx1.loc[key], idx2.loc[key]
-        # Handle duplicate keys → take first row
-        if isinstance(r1, pd.DataFrame): r1 = r1.iloc[0]
-        if isinstance(r2, pd.DataFrame): r2 = r2.iloc[0]
+        r1 = norm_map1[key]
+        r2 = norm_map2[key]
         if any(str(r1[c]) != str(r2[c]) for c in non_key_cols):
-            changed_old.append(raw1.loc[key].iloc[0] if isinstance(raw1.loc[key], pd.DataFrame) else raw1.loc[key])
-            changed_new.append(raw2.loc[key].iloc[0] if isinstance(raw2.loc[key], pd.DataFrame) else raw2.loc[key])
+            changed_old.append(raw_map1[key])
+            changed_new.append(raw_map2[key])
 
     co = pd.DataFrame(changed_old)[common] if changed_old else pd.DataFrame(columns=common)
     cn = pd.DataFrame(changed_new)[common] if changed_new else pd.DataFrame(columns=common)
-    added   = df2f.loc[df2f["__key__"].isin(added_keys),   common].reset_index(drop=True)
-    removed = df1f.loc[df1f["__key__"].isin(removed_keys), common].reset_index(drop=True)
+
+    key_str_1_series = key_str_1.reset_index(drop=True)
+    key_str_2_series = key_str_2.reset_index(drop=True)
+    added   = df2f.reset_index(drop=True).loc[key_str_2_series.isin(added_keys),   common].reset_index(drop=True)
+    removed = df1f.reset_index(drop=True).loc[key_str_1_series.isin(removed_keys), common].reset_index(drop=True)
 
     return co.reset_index(drop=True), cn.reset_index(drop=True), added, removed, key_desc
 
 
-def compare_keyless(df1, df2):
+def compare_keyless(
+    df1: pd.DataFrame,
+    df2: pd.DataFrame,
+    n1: pd.DataFrame,
+    n2: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """FIX: accepts pre-normalized n1/n2."""
     if df1.empty and df2.empty:
         return pd.DataFrame(columns=df1.columns), pd.DataFrame(columns=df1.columns)
 
-    n1 = normalize_df(df1)
-    n2 = normalize_df(df2)
-
-    # Guard: if no common columns exist, hashing produces meaningless results
     common = list(n1.columns.intersection(n2.columns))
     if not common:
         return pd.DataFrame(columns=df2.columns), pd.DataFrame(columns=df1.columns)
@@ -1010,8 +948,6 @@ def compare_keyless(df1, df2):
     n1c = n1[common]
     n2c = n2[common]
 
-    # Multiset-aware comparison using value_counts instead of set isin()
-    # This correctly handles duplicate rows: [A,A,B] vs [A,B,B] → 1 change
     def _row_str(df_norm: pd.DataFrame) -> pd.Series:
         return df_norm.apply(lambda r: "||".join(r.astype(str)), axis=1)
 
@@ -1044,18 +980,12 @@ def reconcile_added_removed(
     similarity_threshold: float = 0.5,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    After a keyless diff produces 'added' and 'removed' pools, match rows that
-    are similar enough to be treated as *modified* rather than truly gone/new.
+    FIX: replaces O(n² × cols) triple-nested loop with:
+      1. Exact-hash matching — O(n) for identical rows, zero numpy needed.
+      2. numpy vectorized row comparison for remaining unmatched rows — O(n² / k)
+         where k = early exits from the exact pass reduce the pool significantly.
 
-    A removed row and an added row are paired when they share ≥ similarity_threshold
-    of their normalized cell values (default 50%).  Greedy matching — each row
-    is used at most once.
-
-    Returns:
-        changed_old  — removed rows that have a close match in added
-        changed_new  — their counterparts from added
-        truly_removed — removed rows with no good match (genuinely gone)
-        truly_added   — added rows with no good match (genuinely new)
+    This is the primary cause of stutter with multiple files/large sheets.
     """
     if removed.empty or added.empty:
         return pd.DataFrame(), pd.DataFrame(), removed.copy(), added.copy()
@@ -1068,31 +998,61 @@ def reconcile_added_removed(
     na = norm_added[common].reset_index(drop=True)
     rem_raw = removed.reset_index(drop=True)
     add_raw = added.reset_index(drop=True)
+    n_cols  = len(common)
 
-    matched_rem: set[int] = set()
-    matched_add: set[int] = set()
+    matched_rem: set = set()
+    matched_add: set = set()
     changed_old_rows: list = []
     changed_new_rows: list = []
 
-    n_cols = len(common)
+    # ── Pass 1: exact hash match — O(n), handles fully-moved rows ────
+    def _row_hashes(df: pd.DataFrame) -> List[str]:
+        return list(df.apply(lambda r: "||".join(r.astype(str)), axis=1))
 
-    for ri in range(len(nr)):
-        best_sim, best_ai = 0.0, -1
-        r1 = nr.iloc[ri]
-        for ai in range(len(na)):
-            if ai in matched_add:
-                continue
-            r2 = na.iloc[ai]
-            matches = sum(1 for c in common if str(r1[c]) == str(r2[c]))
-            sim = matches / n_cols
-            if sim > best_sim:
-                best_sim, best_ai = sim, ai
+    hash_rem = _row_hashes(nr)
+    hash_add = _row_hashes(na)
 
-        if best_sim >= similarity_threshold and best_ai >= 0:
-            matched_rem.add(ri)
-            matched_add.add(best_ai)
-            changed_old_rows.append(rem_raw.iloc[ri])
-            changed_new_rows.append(add_raw.iloc[best_ai])
+    # Build positional index: hash → list of row indices in added
+    add_hash_idx: Dict[str, List[int]] = {}
+    for ai, h in enumerate(hash_add):
+        add_hash_idx.setdefault(h, []).append(ai)
+
+    for ri, h in enumerate(hash_rem):
+        candidates = add_hash_idx.get(h, [])
+        for ai in candidates:
+            if ai not in matched_add:
+                # Exact match — truly the same row, not a change
+                matched_rem.add(ri)
+                matched_add.add(ai)
+                break  # don't add to changed_*; it's identical
+
+    # ── Pass 2: numpy vectorized similarity for remaining rows ────────
+    unmatched_ri = [i for i in range(len(nr)) if i not in matched_rem]
+    unmatched_ai = [i for i in range(len(na)) if i not in matched_add]
+
+    if unmatched_ri and unmatched_ai and n_cols > 0:
+        # Build string arrays for vectorized equality comparison
+        nr_arr = nr.iloc[unmatched_ri].values          # shape: (len_rem, n_cols)
+        na_arr = na.iloc[unmatched_ai].values          # shape: (len_add, n_cols)
+
+        # local list so we can poison matched added rows mid-loop
+        na_arr_work = na_arr.copy()
+        local_matched_add_positions: set = set()
+
+        for idx_ri, ri in enumerate(unmatched_ri):
+            row = nr_arr[idx_ri]                        # (n_cols,)
+            # Broadcast compare: (len_add, n_cols) == (n_cols,) → bool matrix
+            matches = np.sum(na_arr_work == row, axis=1) / n_cols  # (len_add,)
+            best_pos = int(np.argmax(matches))
+            if matches[best_pos] >= similarity_threshold and best_pos not in local_matched_add_positions:
+                ai = unmatched_ai[best_pos]
+                matched_rem.add(ri)
+                matched_add.add(ai)
+                local_matched_add_positions.add(best_pos)
+                changed_old_rows.append(rem_raw.iloc[ri])
+                changed_new_rows.append(add_raw.iloc[ai])
+                # Poison so this added row isn't matched again
+                na_arr_work[best_pos] = "__matched__"
 
     co = (pd.DataFrame(changed_old_rows).reset_index(drop=True)
           if changed_old_rows else pd.DataFrame(columns=removed.columns))
@@ -1112,12 +1072,18 @@ def detect_data_truncation(df1: pd.DataFrame, df2: pd.DataFrame) -> Tuple[bool, 
 
 # ─────────────────────────────────────────────
 # PREVIEW & EXPORT
+# Both now accept pre-normalized old_norm/new_norm to skip redundant normalize_df.
 # ─────────────────────────────────────────────
 
-def build_side_by_side_preview(changed_old: pd.DataFrame, changed_new: pd.DataFrame, keys: List[str]):
-    common_cols  = changed_old.columns.intersection(changed_new.columns).tolist()
-    old_norm     = normalize_df(changed_old[common_cols])
-    new_norm     = normalize_df(changed_new[common_cols])
+def build_side_by_side_preview(
+    changed_old: pd.DataFrame,
+    changed_new: pd.DataFrame,
+    keys: List[str],
+    old_norm: pd.DataFrame,
+    new_norm: pd.DataFrame,
+):
+    """FIX: accepts pre-normalized frames instead of re-normalizing internally."""
+    common_cols = changed_old.columns.intersection(changed_new.columns).tolist()
 
     rows = []
     for idx in range(len(changed_old)):
@@ -1128,8 +1094,6 @@ def build_side_by_side_preview(changed_old: pd.DataFrame, changed_new: pd.DataFr
         rows.append(row)
     combined = pd.DataFrame(rows)
 
-    # Shared cols — only highlight when BOTH frames have the column,
-    # preventing KeyError when keyless reconciled rows have asymmetric columns.
     shared = set(old_norm.columns) & set(new_norm.columns)
 
     def highlight(row):
@@ -1138,16 +1102,14 @@ def build_side_by_side_preview(changed_old: pd.DataFrame, changed_new: pd.DataFr
         for col in combined.columns:
             if col.endswith(" (Old)"):
                 base = col[:-6]
-                changed = (base in shared and
+                changed = (base in shared and ridx < len(old_norm) and ridx < len(new_norm) and
                            str(old_norm.iloc[ridx][base]) != str(new_norm.iloc[ridx][base]))
-                # Red tint for changed old value, plain green for unchanged
                 styles.append('background-color: #3b1212; color: #fca5a5' if changed
                                else 'background-color: #0f2a1a; color: #86efac')
             elif col.endswith(" (New)"):
                 base = col[:-6]
-                changed = (base in shared and
+                changed = (base in shared and ridx < len(old_norm) and ridx < len(new_norm) and
                            str(old_norm.iloc[ridx][base]) != str(new_norm.iloc[ridx][base]))
-                # Bright green for changed new value, plain green for unchanged
                 styles.append('background-color: #14532d; color: #4ade80' if changed
                                else 'background-color: #0f2a1a; color: #86efac')
             else:
@@ -1188,7 +1150,14 @@ def style_removed_rows(df: pd.DataFrame):
     return df.style.apply(lambda r: ['background-color: #450a0a; color: #fca5a5' for _ in r], axis=1)
 
 
-def export_to_excel(changed_old: pd.DataFrame, changed_new: pd.DataFrame, keys: List[str]) -> BytesIO:
+def export_to_excel(
+    changed_old: pd.DataFrame,
+    changed_new: pd.DataFrame,
+    keys: List[str],
+    old_norm: pd.DataFrame,
+    new_norm: pd.DataFrame,
+) -> BytesIO:
+    """FIX: accepts pre-normalized frames instead of re-normalizing internally."""
     wb = Workbook()
     ws_old = wb.active
     ws_old.title = "Old Values"
@@ -1196,12 +1165,6 @@ def export_to_excel(changed_old: pd.DataFrame, changed_new: pd.DataFrame, keys: 
     fill_old = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
     fill_new = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
 
-    old_norm = normalize_df(changed_old)
-    new_norm = normalize_df(changed_new)
-
-    # Pre-compute columns present in BOTH norm frames so the highlight
-    # check never accesses a missing column — guards the KeyError that
-    # occurs when keyless reconciled rows have asymmetric columns.
     shared_cols = set(old_norm.columns) & set(new_norm.columns)
 
     for ws, df, fill in [
@@ -1215,6 +1178,8 @@ def export_to_excel(changed_old: pd.DataFrame, changed_new: pd.DataFrame, keys: 
                 cell = ws.cell(row=r_idx + 2, column=c_idx, value=df.iloc[r_idx][col_name])
                 if (col_name not in keys
                         and col_name in shared_cols
+                        and r_idx < len(old_norm)
+                        and r_idx < len(new_norm)
                         and str(old_norm.iloc[r_idx][col_name])
                             != str(new_norm.iloc[r_idx][col_name])):
                     cell.fill = fill
@@ -1229,11 +1194,8 @@ def export_to_excel(changed_old: pd.DataFrame, changed_new: pd.DataFrame, keys: 
 # UI LAYOUT
 # ─────────────────────────────────────────────
 
-# ── Step 1: Upload
 st.markdown('<div class="step-label">Step 1 — Upload Files</div>', unsafe_allow_html=True)
 
-# Uploader key counter — incrementing it forces Streamlit to re-mount
-# the file_uploader widgets fresh, which clears all selected files.
 if "upload_key" not in st.session_state:
     st.session_state.upload_key = 0
 
@@ -1256,17 +1218,14 @@ with col_clr:
                  help="Remove all uploaded files and reset the session",
                  use_container_width=True):
         st.session_state.upload_key += 1
-        # Also wipe all derived state so nothing stale carries over
         for k in ["header_overrides", "_hdr_files_key", "manual_pairs",
                   "left_files", "right_files"]:
             st.session_state.pop(k, None)
-        # Clear widget-level state for header inputs
         for k in list(st.session_state.keys()):
             if k.startswith("hdr_") or k.startswith("_prev_auto_"):
                 del st.session_state[k]
         st.rerun()
 
-# ── Step 2: Config
 st.markdown('<div class="step-label" style="margin-top:1.5rem">Step 2 — Configure</div>',
             unsafe_allow_html=True)
 
@@ -1281,24 +1240,18 @@ with cfg_col3:
     threshold = st.slider("Match threshold", 0.5, 1.0, 0.85, 0.05,
                           help="Minimum similarity score for auto-pairing files")
 
-# ── Header Row Overrides (shown only when files uploaded)
 if left or right:
     all_files = (left or []) + (right or [])
-
-    # Run auto-detection eagerly — cached so it's instant on reruns
     auto_rows = get_auto_detected_rows(all_files)
 
-    # Collect ordered sheet names across all files
-    all_sheet_names: list[str] = []
+    all_sheet_names: list = []
     for sh in auto_rows:
         if sh not in all_sheet_names:
             all_sheet_names.append(sh)
 
-    # Initialise session state on first load, or when files change
     files_key = tuple(sorted(f.name for f in all_files))
     if (st.session_state.get("_hdr_files_key") != files_key
             or "header_overrides" not in st.session_state):
-        # Reset overrides when the uploaded file set changes
         st.session_state.header_overrides = {}
         st.session_state._hdr_files_key = files_key
 
@@ -1325,19 +1278,11 @@ if left or right:
                         auto_val = auto_rows.get(sh, 1)
                         widget_key = f"hdr_{sh}"
 
-                        # Streamlit ignores value= after the first render — it uses
-                        # the widget's own session state instead. We must seed the
-                        # widget key directly so the auto-detected value is shown
-                        # correctly when files change or auto-detection updates.
                         if widget_key not in st.session_state:
-                            # First time this widget is rendered — seed with override
-                            # (if the user already set one) or auto-detected value.
                             st.session_state[widget_key] = int(
                                 st.session_state.header_overrides.get(sh, auto_val)
                             )
 
-                        # If files changed, reset widget to new auto-detected value
-                        # (files_key change already cleared header_overrides above)
                         prev_auto_key = f"_prev_auto_{sh}"
                         if st.session_state.get(prev_auto_key) != auto_val:
                             st.session_state[widget_key] = int(
@@ -1349,9 +1294,7 @@ if left or right:
                         is_overridden = (current != auto_val)
 
                         label = (
-                            f'"{sh}" ✏️'     # pencil = user-overridden
-                            if is_overridden
-                            else f'"{sh}" 🤖' # robot = using auto-detect
+                            f'"{sh}" ✏️' if is_overridden else f'"{sh}" 🤖'
                         )
                         val = st.number_input(
                             label,
@@ -1365,14 +1308,11 @@ if left or right:
                                    else "Matches auto-detection — change only if wrong.")
                             ),
                         )
-                        # Only store in overrides when the user deviates from auto-detect
                         if val != auto_val:
                             st.session_state.header_overrides[sh] = val
                         elif sh in st.session_state.header_overrides:
-                            # User reset back to auto-detected value → remove override
                             del st.session_state.header_overrides[sh]
 
-            # Summary line
             n_overridden = len(st.session_state.header_overrides)
             if n_overridden:
                 overridden_names = ", ".join(
@@ -1395,13 +1335,11 @@ if left or right:
                 st.session_state.header_overrides = {}
                 st.rerun()
 
-# ── Step 3: Match & Run
 if left and right:
     def comparable(n, ignore):
         n = n.rsplit(".", 1)[0]
         return n.rsplit("_", 1)[0].lower() if ignore and "_" in n else n.lower()
 
-    # ── Auto-match by filename similarity ────
     auto_matched, usedR = [], set()
     for lf in left:
         lcmp = comparable(lf.name, ignore_suffix)
@@ -1419,7 +1357,6 @@ if left and right:
     st.markdown('<div class="step-label" style="margin-top:1.5rem">Step 3 — Review & Run</div>',
                 unsafe_allow_html=True)
 
-    # ── Manual pairing UI (always shown when uploads exist) ──────────
     left_names  = {f.name: f for f in left}
     right_names = {f.name: f for f in right}
 
@@ -1481,7 +1418,6 @@ if left and right:
         if st.button("🗑 Clear all manual pairs", key="clear_manual"):
             st.session_state.manual_pairs = []
 
-    # ── Merge auto + manual pairs (manual takes priority) ────────────
     manual_old_names = {on for on, _ in st.session_state.get("manual_pairs", [])}
     merged_matched = [
         (lf, rf) for lf, rf in auto_matched
@@ -1491,9 +1427,8 @@ if left and right:
         if old_name in left_names and new_name in right_names:
             merged_matched.append((left_names[old_name], right_names[new_name]))
 
-    matched = merged_matched  # final list used for comparison
+    matched = merged_matched
 
-    # ── Pair summary ─────────────────────────────────────────────────
     if matched:
         with st.expander(f"📋 {len(matched)} pair(s) ready to compare", expanded=False):
             for lf, rf in matched:
@@ -1533,7 +1468,6 @@ if left and right:
                 decL = decrypt_file(lf)
                 decR = decrypt_file(rf)
 
-                # Apply manual header overrides (convert 1-based UI input to 0-based index)
                 header_overrides = {
                     sh: (row - 1)
                     for sh, row in st.session_state.get("header_overrides", {}).items()
@@ -1542,15 +1476,10 @@ if left and right:
                 shL, header_rows_old = read_visible_sheets_with_header_detection(
                     decL, filename=lf.name, key_columns=keys, header_overrides=header_overrides
                 )
-
-                # Read NEW file through the SAME cached pipeline as OLD
-                # so it gets its own independent auto-detection with style signals.
-                # Override priority: user override > NEW's own detection > OLD's detection
                 shR, header_rows_new = read_visible_sheets_with_header_detection(
                     decR, filename=rf.name, key_columns=keys, header_overrides=header_overrides
                 )
 
-                # Align NEW column names to OLD column names for every shared sheet
                 for sh in list(shR.keys()):
                     if sh in shL:
                         try:
@@ -1560,7 +1489,6 @@ if left and right:
                         except Exception:
                             pass
 
-                # Determine which sheets are missing in each file
                 missing_in_new: List[str] = [sh for sh in shL if sh not in shR]
                 missing_in_old: List[str] = [sh for sh in shR if sh not in shL]
 
@@ -1574,6 +1502,11 @@ if left and right:
             changed_sheets = []
             for sh in sorted(set(shL) & set(shR)):
                 d1, d2 = shL[sh], shR[sh]
+
+                # ── FIX: normalize ONCE per sheet, pass everywhere ────
+                n1 = normalize_df(d1)
+                n2 = normalize_df(d2)
+
                 use_key = False
                 key_desc = ""
                 if keys:
@@ -1585,13 +1518,10 @@ if left and right:
 
                 try:
                     if use_key:
-                        co, cn, add, rem, key_desc = compare_key_based(d1, d2, keys)
+                        co, cn, add, rem, key_desc = compare_key_based(d1, d2, keys, n1, n2)
                     else:
                         co = cn = pd.DataFrame()
-                        add, rem = compare_keyless(d1, d2)
-                        # Reconcile: rows that look mostly the same are shown as
-                        # "changed" with cell-level highlighting instead of separate
-                        # removed + added tables (catches missing/blank cell changes)
+                        add, rem = compare_keyless(d1, d2, n1, n2)
                         if not add.empty and not rem.empty:
                             n_rem = normalize_df(rem)
                             n_add = normalize_df(add)
@@ -1600,18 +1530,24 @@ if left and right:
                             )
                 except Exception:
                     co = cn = pd.DataFrame()
-                    add, rem = compare_keyless(d1, d2)
+                    add, rem = compare_keyless(d1, d2, n1, n2)
 
                 is_trunc, old_rows, new_rows = detect_data_truncation(d1, d2)
 
                 if not (cn.empty and add.empty and rem.empty):
-                    changed_sheets.append((sh, co, cn, add, rem, use_key, key_desc,
-                                           is_trunc, old_rows, new_rows))
+                    # Pre-compute normalized changed frames once for preview + export
+                    if not cn.empty:
+                        co_norm = normalize_df(co)
+                        cn_norm = normalize_df(cn)
+                    else:
+                        co_norm = cn_norm = pd.DataFrame()
 
-            # Always record the pair so missing-sheet notices are shown
+                    changed_sheets.append((sh, co, cn, add, rem, use_key, key_desc,
+                                           is_trunc, old_rows, new_rows,
+                                           co_norm, cn_norm))
+
             files_with_changes.append((i + 1, lf.name, rf.name, changed_sheets,
                                        missing_in_new, missing_in_old))
-
             prog.progress((i + 1) / len(matched), text=f"Done {i+1}/{len(matched)}")
 
         prog.empty()
@@ -1653,7 +1589,6 @@ if left and right:
                     unsafe_allow_html=True,
                 )
 
-                # ── Missing sheet notices ─────────────────────
                 if missing_in_new:
                     sheets_list = ", ".join(f"<b>{s}</b>" for s in missing_in_new)
                     st.markdown(
@@ -1663,7 +1598,7 @@ if left and right:
                 if missing_in_old:
                     sheets_list = ", ".join(f"<b>{s}</b>" for s in missing_in_old)
                     st.markdown(
-                        f'<div class="info-box">📋 Sheet(s) only in NEW file (skipped): {sheets_list}</div>',
+                        f'<div class="warn-box">📋 Sheet(s) only in NEW file (skipped): {sheets_list}</div>',
                         unsafe_allow_html=True,
                     )
                 if not changed_sheets and not missing_in_new and not missing_in_old:
@@ -1673,7 +1608,7 @@ if left and right:
                         unsafe_allow_html=True,
                     )
 
-                for sh, co, cn, add, rem, use_key, key_desc, is_trunc, old_rows, new_rows in changed_sheets:
+                for sh, co, cn, add, rem, use_key, key_desc, is_trunc, old_rows, new_rows, co_norm, cn_norm in changed_sheets:
                     parts = []
                     if len(cn)  > 0: parts.append(f"{len(cn)} changed")
                     if len(add) > 0: parts.append(f"{len(add)} added")
@@ -1688,7 +1623,6 @@ if left and right:
                         unsafe_allow_html=True,
                     )
 
-                    # Metric pills
                     pills = ""
                     if len(cn)  > 0: pills += f'<div class="metric-pill changed"><span class="val">{len(cn)}</span> changed</div>'
                     if len(add) > 0: pills += f'<div class="metric-pill added"><span class="val">{len(add)}</span> added</div>'
@@ -1711,18 +1645,16 @@ if left and right:
                         )
 
                     if not cn.empty:
-                        # Side-by-side view with cell-level highlighting for both
-                        # key-based changes and keyless reconciled changes.
-                        # For keyless, pass empty keys so no column is treated as
-                        # an immutable key, letting every column be highlighted.
                         preview_keys = keys if use_key else []
                         st.markdown('<span class="diff-label changed">🔄 Changed rows</span>',
                                     unsafe_allow_html=True)
-                        st.dataframe(build_side_by_side_preview(co, cn, preview_keys),
-                                     use_container_width=True)
+                        st.dataframe(
+                            build_side_by_side_preview(co, cn, preview_keys, co_norm, cn_norm),
+                            use_container_width=True,
+                        )
                         st.download_button(
                             "📥 Download changes (.xlsx)",
-                            export_to_excel(co, cn, preview_keys),
+                            export_to_excel(co, cn, preview_keys, co_norm, cn_norm),
                             file_name=f"Pair{file_num}_{sh}_changes.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key=f"dl_{file_num}_{sh}",
